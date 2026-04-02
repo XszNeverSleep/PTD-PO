@@ -26,7 +26,7 @@ MAX_PROMPT_LENGTH=4096
 MAX_RESPONSE_LENGTH=2048
 
 
-CONGI_FILE="examples/configs/config_dapo.yaml"
+CONGI_FILE="examples/configs/config_grpo.yaml"
 TRAIN_FILE="/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train/data"
 VAL_FILE="/mnt/llm-plus-public/dataset/PAPO_MMK12_test/data"
 
