@@ -138,6 +138,13 @@ class ActorConfig:
     use_kl_loss: bool = field(default=False, init=False)
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
+    kl_direction: str = field(default="reverse_kl", init=False)
+    enable_pid: bool = field(default=False, init=False)
+    pid_coef: float = field(default=1.0, init=False)
+    pid_top_k: int = field(default=64, init=False)
+    pid_kl_direction: str = field(default="forward_kl", init=False)
+    use_ori_entropy_loss: bool = field(default=False, init=False)
+    ori_entropy_loss_coef: float = field(default=0.0, init=False)
 
 
 @dataclass

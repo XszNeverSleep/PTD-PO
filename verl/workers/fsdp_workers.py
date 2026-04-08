@@ -662,6 +662,36 @@ class FSDPWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_teacher_log_probs(self, data: DataProto):
+        """Compute PID teacher log_probs/top-K for PID-active samples using old-policy weights."""
+        assert self._has_actor
+
+        self._process_multi_modal_inputs(data)
+        data = data.to(torch.cuda.current_device())
+
+        if self._use_param_offload:
+            load_fsdp_model(self.fsdp_module)
+
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output = self.actor.compute_teacher_log_prob(data=data)
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        # unshard the root FSDP module
+        if self.world_size > 1:
+            self.fsdp_module._handle.reshard(True)
+
+        if self._use_param_offload:
+            offload_fsdp_model(self.fsdp_module)
+
+        output = output.to("cpu")
+        # Release reserved-but-unallocated CUDA memory so update_actor's backward
+        # can find contiguous free blocks instead of fragmenting against teacher temporaries.
+        torch.cuda.empty_cache()
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_probs(self, data: DataProto):
         assert self._has_ref
 

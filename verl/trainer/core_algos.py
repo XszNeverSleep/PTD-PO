@@ -23,6 +23,8 @@ from collections import defaultdict
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -561,20 +563,44 @@ def compute_kl(
     log_probs: torch.FloatTensor,
     ref_log_probs: torch.FloatTensor,
     kl_penalty: Literal["kl", "abs", "mse", "low_var_kl", "full"],
+    kl_direction: str = "forward_kl",
 ) -> torch.Tensor:
     """Compute KL divergence given log_probs and ref_log_probs.
 
     Adapted from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/ppo_trainer.py#L1150
 
     Args:
-        log_probs: torch.Tensor
-        ref_log_probs: torch.Tensor
+        log_probs: torch.Tensor — actor (student) log probs, shape [B, T]
+        ref_log_probs: torch.Tensor — reference (teacher) log probs, shape [B, T]
         kl_penalty: str ("kl", "abs", "mse", "low_var_kl", "full")
+        kl_direction: str ("reverse_kl", "forward_kl", "jsd_kl")
+            - reverse_kl: KL(actor || ref)  (default, same as original behavior)
+            - forward_kl: KL(ref || actor)  — swap P and Q
+            - jsd_kl: JSD(actor, ref) = 0.5*KL(actor||M) + 0.5*KL(ref||M), M = 0.5*(actor+ref)
 
     Returns:
-        kl_div: torch.Tensor
+        kl_div: torch.Tensor, shape [B, T]
 
     """
+    # Handle kl_direction by swapping arguments
+    if kl_direction == "forward_kl":
+        # KL(ref || actor): swap so ref is "P" and actor is "Q"
+        log_probs, ref_log_probs = ref_log_probs, log_probs
+    elif kl_direction == "jsd_kl":
+        # JSD: compute midpoint M = 0.5*(P+Q), then 0.5*KL(P||M) + 0.5*KL(Q||M)
+        # Per-token: p = exp(log_probs), q = exp(ref_log_probs), m = 0.5*(p+q)
+        log_probs_f, ref_log_probs_f = log_probs.float(), ref_log_probs.float()
+        p = log_probs_f.exp()   # [B, T]
+        q = ref_log_probs_f.exp()   # [B, T]
+        m = 0.5 * (p + q)  # [B, T] midpoint distribution
+        log_m = m.clamp(min=1e-10).log()
+        # JSD = 0.5 * p * log(p/m) + 0.5 * q * log(q/m)
+        jsd = 0.5 * p * (log_probs_f - log_m) + 0.5 * q * (ref_log_probs_f - log_m)
+        return jsd
+    elif kl_direction != "reverse_kl":
+        raise ValueError(f"Unknown kl_direction: {kl_direction}")
+
+    # Existing kl_penalty logic (unchanged) — now operates on possibly-swapped args
     log_probs, ref_log_probs = log_probs.float(), ref_log_probs.float()
     if kl_penalty == "kl":
         return log_probs - ref_log_probs
@@ -597,3 +623,149 @@ def compute_kl(
         return F.kl_div(ref_log_probs, log_probs, log_target=True, reduction="none").sum(-1)
 
     raise NotImplementedError(f"Unknown KL penalty: {kl_penalty}.")
+
+
+def _topk_match_and_gather(
+    query_ids: torch.Tensor,
+    key_topk_log_probs: torch.Tensor,
+    key_topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """For each query index, look it up in key's stored top-K and return log-prob.
+
+    Indices not found in key's top-K are approximated as uniform over key's remaining
+    tail mass: log(tail_mass / (approx_vocab_size - M)).
+
+    Args:
+        query_ids:          [B, T, K] token indices to look up
+        key_topk_log_probs: [B, T, M] key's stored top-M log-softmax values
+        key_topk_ids:       [B, T, M] key's stored top-M token indices
+
+    Returns:
+        [B, T, K] key's log-prob at each query index
+    """
+    M = key_topk_ids.shape[-1]
+
+    # Match: [B, T, K, 1] == [B, T, 1, M] -> [B, T, K, M]
+    match = query_ids.unsqueeze(-1).eq(key_topk_ids.unsqueeze(-2))
+    # Sum matched log-probs over M dim: 0 for unmatched, log-prob for matched
+    lp_matched = (match.float() * key_topk_log_probs.unsqueeze(-2)).sum(-1)  # [B, T, K]
+    has_match = match.any(-1)  # [B, T, K]
+
+    # Uniform approximation for miss indices not in key's stored top-M
+    key_tail_mass = (1.0 - key_topk_log_probs.exp().sum(-1)).clamp(min=1e-10)  # [B, T]
+    vocab_miss_count = max(1, 150000 - M)
+    miss_lp = (key_tail_mass.log() - math.log(vocab_miss_count)).unsqueeze(-1)  # [B, T, 1]
+
+    return torch.where(has_match, lp_matched, miss_lp.expand_as(lp_matched))  # [B, T, K]
+
+
+def compute_topk_kl(
+    student_topk_log_probs: torch.Tensor,
+    student_topk_probs: torch.Tensor,
+    student_topk_ids: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    kl_direction: str = "forward_kl",
+) -> torch.Tensor:
+    """KL divergence using independent top-K sets with tail compensation.
+
+    Student and teacher each have their own top-K. Cross-reference via matching:
+    for tokens in student's top-K that are missing from teacher's top-K, approximate
+    teacher's probability as uniform over the tail.
+
+    Args:
+        student_topk_log_probs: [B, T, K] student's top-K log-softmax values (with grad)
+        student_topk_probs:     [B, T, K] student's top-K softmax probs (with grad)
+        student_topk_ids:       [B, T, K] student's top-K token indices
+        teacher_topk_log_probs: [B, T, M] teacher's top-K log-softmax values (detached)
+        teacher_topk_ids:       [B, T, M] teacher's top-K token indices (detached)
+        kl_direction: 'forward_kl', 'reverse_kl', or 'jsd_kl'
+
+    Returns:
+        kl: [B, T] per-token KL divergence
+    """
+    # Ensure teacher tensors carry no grad (defensive; they should already be detached)
+    teacher_topk_log_probs = teacher_topk_log_probs.detach()
+    teacher_topk_ids = teacher_topk_ids.detach()
+
+    # Gather teacher log-probs at student's top-K positions: [B, T, K]
+    teacher_lp_at_student = _topk_match_and_gather(
+        student_topk_ids, teacher_topk_log_probs, teacher_topk_ids
+    ).detach()  # detach: no grad through teacher branch
+    teacher_probs_at_student = teacher_lp_at_student.exp()  # [B, T, K]
+
+    # Tail mass in fp32 for numerical stability
+    p_tail_s = (1.0 - student_topk_probs.sum(-1)).to(torch.float32).clamp(min=1e-8)  # [B, T]
+    p_tail_t = (1.0 - teacher_probs_at_student.sum(-1)).to(torch.float32).clamp(min=1e-8)  # [B, T]
+
+    if kl_direction == "forward_kl":
+        # KL(student || teacher) = sum_k p_s[k] * (log p_s[k] - log p_t[k]) + p_tail_s * (log p_tail_s - log p_tail_t)
+        topk_kl = (student_topk_probs * (student_topk_log_probs - teacher_lp_at_student)).sum(-1)  # [B, T]
+        tail_kl = (p_tail_s * (p_tail_s.log() - p_tail_t.log())).to(student_topk_probs.dtype)  # [B, T]
+        return topk_kl + tail_kl
+
+    elif kl_direction == "reverse_kl":
+        # KL(teacher || student): same student top-K support, swap P and Q
+        topk_kl = (teacher_probs_at_student * (teacher_lp_at_student - student_topk_log_probs)).sum(-1)  # [B, T]
+        tail_kl = (p_tail_t * (p_tail_t.log() - p_tail_s.log())).to(student_topk_probs.dtype)  # [B, T]
+        return topk_kl + tail_kl
+
+    elif kl_direction == "jsd_kl":
+        # JSD = 0.5 * KL(S || M) + 0.5 * KL(T || M), M = 0.5 * (S + T)
+        # Both terms evaluated on the same student top-K support
+        m_probs = 0.5 * (student_topk_probs + teacher_probs_at_student)  # [B, T, K]
+        m_log_probs = m_probs.clamp(min=1e-10).log()
+        m_tail = 0.5 * (p_tail_s + p_tail_t)  # [B, T]
+        m_tail_log = m_tail.clamp(min=1e-10).log()
+
+        # KL(S || M): stop-grad on p_s weight to bound gradient when p_s -> 0
+        kl_s_m = (student_topk_probs.detach() * (student_topk_log_probs - m_log_probs)).sum(-1) \
+                 + (p_tail_s.detach() * (p_tail_s.log() - m_tail_log)).to(student_topk_probs.dtype)
+        # KL(T || M): teacher already detached, no extra stop-grad needed
+        kl_t_m = (teacher_probs_at_student * (teacher_lp_at_student - m_log_probs)).sum(-1) \
+                 + (p_tail_t * (p_tail_t.log() - m_tail_log)).to(student_topk_probs.dtype)
+
+        return 0.5 * (kl_s_m + kl_t_m)
+
+    raise ValueError(f"Unknown kl_direction: {kl_direction}")
+
+
+def compute_pid_mask(
+    accuracy_scores: torch.Tensor,
+    group_index: np.ndarray,
+    pid_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Determine which samples get PID distillation.
+
+    PID activates for groups where group accuracy < pid_threshold.
+    Within such groups, only incorrect trajectories receive PID loss,
+    but ALL samples in these groups skip standard ref KL.
+
+    Args:
+        accuracy_scores: [B] per-sample accuracy (0.0 or 1.0)
+        group_index: [B] group uid (np.ndarray of object)
+        pid_threshold: float — group accuracy threshold
+
+    Returns:
+        pid_mask: [B] bool. True = receives PID loss (incorrect in PID group)
+        pid_group_mask: [B] bool. True = in PID group (skips ref KL, both correct and incorrect)
+    """
+    bsz = accuracy_scores.shape[0]
+    pid_mask = torch.zeros(bsz, dtype=torch.bool)
+    pid_group_mask = torch.zeros(bsz, dtype=torch.bool)
+
+    id2indices = defaultdict(list)
+    id2acc = defaultdict(list)
+    for i in range(bsz):
+        id2indices[group_index[i]].append(i)
+        id2acc[group_index[i]].append(accuracy_scores[i].item())
+
+    for uid in id2indices:
+        group_accuracy = sum(1 for a in id2acc[uid] if a == 1.0) / len(id2acc[uid])
+        if group_accuracy < pid_threshold:
+            for idx, acc in zip(id2indices[uid], id2acc[uid]):
+                pid_group_mask[idx] = True
+                if acc != 1.0:
+                    pid_mask[idx] = True
+
+    return pid_mask, pid_group_mask

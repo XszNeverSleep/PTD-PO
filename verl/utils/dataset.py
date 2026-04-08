@@ -112,6 +112,8 @@ class RLHFDataset(Dataset):
         max_pixels: Optional[int] = None,
         filter_overlong_prompts: bool = True,
         filter_overlong_prompts_workers: int = 16,
+        prompt_with_hint_key: Optional[str] = None,
+        max_hint_prompt_length: Optional[int] = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -125,6 +127,8 @@ class RLHFDataset(Dataset):
         self.truncation = truncation
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.prompt_with_hint_key = prompt_with_hint_key
+        self.max_hint_prompt_length = max_hint_prompt_length or max_prompt_length
 
         if "@" in data_path:
             data_path, data_split = data_path.split("@")
@@ -183,6 +187,32 @@ class RLHFDataset(Dataset):
             return [{"role": "user", "content": content_list}]
         else:
             return [{"role": "user", "content": prompt_str}]
+
+    def _build_hint_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build chat messages from hint prompt. Uses same image/video placeholder handling as _build_messages."""
+        hint_str: str = example[self.prompt_with_hint_key]
+        if self.format_prompt:
+            format_prompt = Template(self.format_prompt.strip())
+            hint_str = format_prompt.render(content=hint_str)
+
+        if self.image_key in example:
+            content_list = []
+            for i, content in enumerate(hint_str.split("<image>")):
+                if i != 0:
+                    content_list.append({"type": "image"})
+                if content:
+                    content_list.append({"type": "text", "text": content})
+            return [{"role": "user", "content": content_list}]
+        elif self.video_key in example:
+            content_list = []
+            for i, content in enumerate(hint_str.split("<video>")):
+                if i != 0:
+                    content_list.append({"type": "video"})
+                if content:
+                    content_list.append({"type": "text", "text": content})
+            return [{"role": "user", "content": content_list}]
+        else:
+            return [{"role": "user", "content": hint_str}]
 
     def _filter_overlong_prompts(self, example: dict[str, Any]) -> bool:
         messages = self._build_messages(example)
@@ -311,4 +341,94 @@ class RLHFDataset(Dataset):
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
         example["ground_truth"] = example.pop(self.answer_key)
+
+        # Tokenize hint prompt for PID mode (skip if key absent or hint string is empty)
+        if self.prompt_with_hint_key and self.prompt_with_hint_key in example:
+            hint_str = example.get(self.prompt_with_hint_key, "")
+            if hint_str and hint_str.strip():
+                hint_messages = self._build_hint_messages(example)
+
+                if self.image_key in example and self.processor is not None:
+                    hint_prompt = self.processor.apply_chat_template(
+                        hint_messages, add_generation_prompt=True, tokenize=False
+                    )
+                    # Re-use already-processed images (processed_images from earlier scope)
+                    hint_model_inputs = self.processor(
+                        processed_images, [hint_prompt], add_special_tokens=False, return_tensors="pt"
+                    )
+                elif self.video_key in example and self.processor is not None:
+                    hint_prompt = self.processor.apply_chat_template(
+                        hint_messages, add_generation_prompt=True, tokenize=False
+                    )
+                    hint_model_inputs = self.processor(
+                        videos=processed_videos, text=[hint_prompt], add_special_tokens=False, return_tensors="pt"
+                    )
+                else:
+                    hint_prompt = self.tokenizer.apply_chat_template(
+                        hint_messages, add_generation_prompt=True, tokenize=False
+                    )
+                    hint_model_inputs = self.tokenizer(
+                        [hint_prompt], add_special_tokens=False, return_tensors="pt"
+                    )
+
+                hint_input_ids = hint_model_inputs.pop("input_ids")[0]  # (hint_seq_len,)
+                hint_attention_mask = hint_model_inputs.pop("attention_mask")[0]  # (hint_seq_len,)
+
+                # Position IDs for hint prompt
+                if (
+                    self.processor is not None
+                    and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
+                ):
+                    if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                        from ..models.transformers.qwen3_vl import get_rope_index
+                    else:
+                        from ..models.transformers.qwen2_vl import get_rope_index
+
+                    hint_vision_pos = get_rope_index(
+                        self.processor,
+                        input_ids=hint_input_ids,
+                        image_grid_thw=hint_model_inputs.get("image_grid_thw", None),
+                        video_grid_thw=hint_model_inputs.get("video_grid_thw", None),
+                        second_per_grid_ts=hint_model_inputs.get("second_per_grid_ts", None),
+                        attention_mask=hint_attention_mask,
+                    )  # (3, hint_seq_len)
+                    hint_text_pos = torch.arange(len(hint_input_ids)).unsqueeze(0)  # (1, hint_seq_len)
+                    hint_position_ids = torch.cat((hint_text_pos, hint_vision_pos), dim=0)  # (4, hint_seq_len)
+                else:
+                    hint_position_ids = torch.clip(
+                        hint_attention_mask.cumsum(dim=0) - 1, min=0, max=None
+                    )  # (hint_seq_len,)
+
+                # Left-pad to max_hint_prompt_length
+                hint_input_ids, hint_attention_mask, hint_position_ids = VF.postprocess_data(
+                    input_ids=hint_input_ids,
+                    attention_mask=hint_attention_mask,
+                    position_ids=hint_position_ids,
+                    max_length=self.max_hint_prompt_length,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    left_pad=True,
+                    truncation="right",
+                )
+                hint_raw_prompt_ids = self.tokenizer.encode(hint_prompt, add_special_tokens=False)
+                if len(hint_raw_prompt_ids) > self.max_hint_prompt_length:
+                    hint_raw_prompt_ids = hint_raw_prompt_ids[: self.max_hint_prompt_length]
+
+                example["hint_input_ids"] = hint_input_ids
+                example["hint_attention_mask"] = hint_attention_mask
+                example["hint_position_ids"] = hint_position_ids
+                example["hint_raw_prompt_ids"] = hint_raw_prompt_ids
+            else:
+                # Empty hint: store zero tensors so collate_fn can stack them
+                example["hint_input_ids"] = torch.zeros(self.max_hint_prompt_length, dtype=input_ids.dtype)
+                example["hint_attention_mask"] = torch.zeros(self.max_hint_prompt_length, dtype=attention_mask.dtype)
+                if position_ids.dim() == 1:
+                    example["hint_position_ids"] = torch.zeros(self.max_hint_prompt_length, dtype=position_ids.dtype)
+                else:
+                    # mRoPE: (4, max_hint_prompt_length)
+                    example["hint_position_ids"] = torch.zeros(
+                        position_ids.shape[0], self.max_hint_prompt_length, dtype=position_ids.dtype
+                    )
+                example["hint_raw_prompt_ids"] = []
+            example.pop(self.prompt_with_hint_key, None)
+
         return example

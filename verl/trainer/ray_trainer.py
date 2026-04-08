@@ -50,6 +50,7 @@ from .core_algos import (
     KLController,
     compute_advantage_return,
     compute_kl,
+    compute_pid_mask,
     get_kl_controller,
 )
 from .metrics import (
@@ -114,14 +115,17 @@ class ResourcePoolManager:
             raise ValueError(f"Total available GPUs {gpus_available} is less than total desired GPUs {gpus_required}.")
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl"):
+def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl", kl_direction="reverse_kl"):
     """Apply KL penalty to the token-level rewards."""
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
     response_mask = data.batch["response_mask"]
 
     # compute kl between ref_policy and current policy
-    kld = compute_kl(data.batch["old_log_probs"], data.batch["ref_log_probs"], kl_penalty=kl_penalty)
+    kld = compute_kl(
+        data.batch["old_log_probs"], data.batch["ref_log_probs"],
+        kl_penalty=kl_penalty, kl_direction=kl_direction,
+    )
     kld = kld * response_mask  # (batch_size, response_length)
 
     data.batch["token_level_rewards"] = token_level_scores - kl_ctrl.kl_coef * kld
@@ -626,16 +630,74 @@ class RayPPOTrainer:
                 with timer("adv", timing_raw):
                     if "token_level_scores" not in batch.batch:
                         # get token level scores asynchronously
-                        reward_tensor, reward_metrics = ray.get(reward_ref)
+                        reward_tensor, reward_metrics_raw = ray.get(reward_ref)
                         batch.batch["token_level_scores"] = reward_tensor
-                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics_raw).items()}
                         metrics.update(reward_metrics)
+                    else:
+                        reward_metrics_raw = None
+
+                    # Compute PID mask if PID is enabled and hint data is available
+                    if self.config.algorithm.enable_pid and "hint_input_ids" in batch.batch:
+                        # Get raw accuracy list from reward metrics
+                        if reward_metrics_raw is not None:
+                            accuracy_list = reward_metrics_raw.get("accuracy", None)
+                        else:
+                            # online_filtering case: accuracy was accumulated in all_metrics earlier
+                            accuracy_list = all_metrics.get("accuracy", None)
+
+                        if accuracy_list is None:
+                            print("Warning: PID requires 'accuracy' in reward scores. Skipping PID for this step.")
+                        else:
+                            accuracy_scores = torch.tensor(accuracy_list, dtype=torch.float32)
+
+                            # Build a "has_hint" mask: samples whose hint_attention_mask is all-zeros have no hint
+                            has_hint = batch.batch["hint_attention_mask"].sum(dim=-1) > 0  # [B] bool
+
+                            pid_mask, pid_group_mask = compute_pid_mask(
+                                accuracy_scores, batch.non_tensor_batch["uid"],
+                                self.config.algorithm.pid_threshold,
+                            )
+                            pid_mask = pid_mask & has_hint  # Exclude samples without valid hint data
+                            pid_group_mask = pid_group_mask & has_hint
+
+                            batch.batch["pid_mask"] = pid_mask
+                            batch.batch["pid_group_mask"] = pid_group_mask
+                            uids = batch.non_tensor_batch["uid"]
+                            pid_groups = len(set(uids[i] for i in range(len(uids)) if pid_group_mask[i]))
+                            total_groups = len(set(uids))
+                            metrics["pid/pid_groups"] = pid_groups
+                            metrics["pid/total_groups"] = total_groups
+                            metrics["pid/pid_trajectories"] = pid_mask.sum().item()
+                            metrics["pid/pid_group_trajectories"] = pid_mask.sum().item()
+                            metrics["pid/total_trajectories"] = pid_mask.numel()
+                            metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
+                            metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
+
+                            # Compute teacher outputs with old-policy weights — once, before update_actor.
+                            # Results are union-ed into batch so update_policy can split them per mini-batch.
+                            if pid_mask.any():
+                                with timer("teacher", timing_raw):
+                                    teacher_output = self.actor_rollout_ref_wg.compute_teacher_log_probs(batch)
+                                    batch = batch.union(teacher_output)
 
                     # apply kl penalty if available
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
                         # apply kl penalty to reward
-                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                        batch, kl_metrics = apply_kl_penalty(
+                            batch, self.kl_ctrl,
+                            self.config.algorithm.kl_penalty,
+                            self.config.algorithm.kl_direction,
+                        )
                         metrics.update(kl_metrics)
+
+                        # Zero out KL penalty for PID groups (PID replaces ref KL entirely)
+                        if self.config.algorithm.enable_pid and "pid_group_mask" in batch.batch:
+                            pid_m = batch.batch["pid_group_mask"].unsqueeze(-1).float()  # [B, 1]
+                            batch.batch["token_level_rewards"] = (
+                                batch.batch["token_level_rewards"] * (1 - pid_m)
+                                + batch.batch["token_level_scores"] * pid_m
+                            )
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 

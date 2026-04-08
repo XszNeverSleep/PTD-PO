@@ -55,6 +55,10 @@ class DataConfig:
     max_pixels: Optional[int] = 4194304
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
+    prompt_with_hint_key: Optional[str] = None
+    """Key for hint-augmented prompt column. Set to enable PID data loading."""
+    max_hint_prompt_length: Optional[int] = None
+    """Max length for hint prompts (defaults to max_prompt_length if None)."""
 
     def post_init(self):
         self.image_dir = get_abs_path(self.image_dir, prompt="Image directory")
@@ -92,6 +96,22 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
+    kl_direction: str = "reverse_kl"
+    """KL direction for standard ref KL: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
+    enable_pid: bool = False
+    """Enable PID mode: online policy distillation from hint-augmented teacher."""
+    pid_threshold: float = 1.0
+    """Group accuracy threshold. PID activates for groups with accuracy < threshold."""
+    pid_coef: float = 1.0
+    """Coefficient for PID distillation loss."""
+    pid_top_k: int = 64
+    """Top-K tokens for Top-K with Tail KL. 0 = single-token KL mode."""
+    pid_kl_direction: str = "forward_kl"
+    """KL direction for PID distillation: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
+    use_ori_entropy_loss: bool = False
+    """Add original-policy entropy bonus on PID-active samples: -E[log π(a|s)]."""
+    ori_entropy_loss_coef: float = 0.0
+    """Coefficient for ori_entropy_loss."""
 
 
 @dataclass
@@ -160,6 +180,13 @@ class PPOConfig:
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
+        self.worker.actor.kl_direction = self.algorithm.kl_direction
+        self.worker.actor.enable_pid = self.algorithm.enable_pid
+        self.worker.actor.pid_coef = self.algorithm.pid_coef
+        self.worker.actor.pid_top_k = self.algorithm.pid_top_k
+        self.worker.actor.pid_kl_direction = self.algorithm.pid_kl_direction
+        self.worker.actor.use_ori_entropy_loss = self.algorithm.use_ori_entropy_loss
+        self.worker.actor.ori_entropy_loss_coef = self.algorithm.ori_entropy_loss_coef
 
     def deep_post_init(self):
         recursive_post_init(self)

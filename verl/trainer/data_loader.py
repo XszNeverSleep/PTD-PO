@@ -41,6 +41,8 @@ def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, proces
         max_pixels=config.max_pixels,
         filter_overlong_prompts=config.filter_overlong_prompts,
         filter_overlong_prompts_workers=config.filter_overlong_prompts_workers,
+        prompt_with_hint_key=config.prompt_with_hint_key,
+        max_hint_prompt_length=config.max_hint_prompt_length,
     )
     # use sampler for better ckpt resume
     if config.shuffle:

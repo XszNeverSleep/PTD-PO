@@ -68,6 +68,7 @@ worker:
     temperature: 1.0
     top_p: 1.0
     limit_images: 0
+    max_num_batched_tokens: 10240
     gpu_memory_utilization: 0.6
     enforce_eager: false
     enable_chunked_prefill: false
