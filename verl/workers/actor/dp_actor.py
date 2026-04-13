@@ -341,18 +341,26 @@ class DataParallelPPOActor(BasePPOActor):
             position_ids=teacher_pos,
             use_cache=False,
         )
-        # Slice logits for response portion: [P, resp_len, V]
-        logits = output.logits[:, -resp_len - 1 : -1, :].detach()
+        # Clone only the response slice [P, resp_len, V] — avoids keeping the full
+        # [P, hint_len+resp_len, V] allocation alive via a view into output.logits.
+        logits = output.logits[:, -resp_len - 1 : -1, :].detach().clone()  # [P, resp_len, V]
+        del output  # free full [P, hint_len+resp_len, V] tensor
         logits.div_(temperature)
 
         if top_k > 0:
-            # Teacher computes its own independent top-K
-            log_probs_full = torch.nn.functional.log_softmax(logits.float(), dim=-1)  # [P, resp_len, V]
+            # Compute top-K indices first (BF16 logits, no large allocation)
             _, topk_ids = torch.topk(logits, k=top_k, dim=-1)  # [P, resp_len, K]
-            topk_log_probs = torch.gather(log_probs_full, -1, topk_ids)  # [P, resp_len, K]
+            # Memory-efficient log_softmax at K positions only:
+            # log_softmax(x_i) = x_i - logsumexp(x_all) — avoids full [P, T, V] float32
+            log_Z = torch.logsumexp(logits, dim=-1, keepdim=True)  # [P, resp_len, 1]
+            topk_log_probs = (torch.gather(logits, -1, topk_ids) - log_Z).float()  # [P, resp_len, K]
+            del logits  # free [P, resp_len, V]
+            torch.cuda.empty_cache()  # return pool fragments to CUDA before next micro-batch
             return topk_log_probs, topk_ids  # both detached
         else:
             log_probs = self.log_probs_from_logits(logits, responses)  # [P, resp_len] — detached
+            del logits
+            torch.cuda.empty_cache()
             return log_probs
 
     @torch.no_grad()
@@ -399,7 +407,7 @@ class DataParallelPPOActor(BasePPOActor):
             # Zero out non-PID positions (never read, but keeps tensors clean)
             mask = pid_mask[:, None, None].float()    # [B, 1, 1]
             return DataProto.from_dict(tensors={
-                "teacher_topk_log_probs": teacher_lp  * mask,   # [B, T, K]
+                "teacher_topk_log_probs": teacher_lp  * mask,        # [B, T, K]
                 "teacher_topk_ids":       teacher_ids * mask.long(),  # [B, T, K]
             })
         else:
@@ -413,8 +421,8 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # [mb, T] — detached
                 all_lp.append(t_lp)
 
-            teacher_lp = torch.cat(all_lp, dim=0)              # [B, T]
-            mask = pid_mask[:, None].float()                    # [B, 1]
+            teacher_lp = torch.cat(all_lp, dim=0)   # [B, T]
+            mask = pid_mask[:, None].float()         # [B, 1]
             return DataProto.from_dict(tensors={
                 "teacher_log_probs": teacher_lp * mask,         # [B, T]
             })
@@ -461,10 +469,8 @@ class DataParallelPPOActor(BasePPOActor):
             s_topk_p   = s_topk_p[pid_idx]     # [P, T, K] — with grad
             s_topk_ids = s_topk_ids[pid_idx]   # [P, T, K] — detached
 
-            dev = s_topk_lp.device
-            # Teacher tensors are CPU-offloaded; move only the PID slice to GPU
-            t_topk_lp  = model_inputs["teacher_topk_log_probs"][pid_idx].to(dev)  # [P, T, K] detached
-            t_topk_ids = model_inputs["teacher_topk_ids"][pid_idx].to(dev)        # [P, T, K] detached
+            t_topk_lp  = model_inputs["teacher_topk_log_probs"][pid_idx]  # [P, T, K] detached
+            t_topk_ids = model_inputs["teacher_topk_ids"][pid_idx]        # [P, T, K] detached
 
             kl = compute_topk_kl(
                 student_topk_log_probs=s_topk_lp,
@@ -476,13 +482,12 @@ class DataParallelPPOActor(BasePPOActor):
             )  # [P, T]
         else:
             # Single-token mode: read pre-computed teacher log-probs from model_inputs
-            s_log_probs = student_log_probs[pid_idx]                             # [P, T] — with grad
-            # Teacher tensor is CPU-offloaded; move only the PID slice to GPU
-            t_log_probs = model_inputs["teacher_log_probs"][pid_idx].to(s_log_probs.device)  # [P, T]
+            s_log_probs = student_log_probs[pid_idx]                  # [P, T] — with grad
+            t_log_probs = model_inputs["teacher_log_probs"][pid_idx]  # [P, T] detached
             kl = compute_kl(
                 log_probs=s_log_probs,
                 ref_log_probs=t_log_probs,
-                kl_penalty=self.config.kl_penalty,
+                kl_penalty=self.config.pid_kl_penalty,
                 kl_direction=self.config.pid_kl_direction,
             )  # [P, T]
 
@@ -492,15 +497,6 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
-
-        # Teacher tensors [B, T, K] are huge (especially int64 ids). CPU-offload them here
-        # so data.to(device) in fsdp_workers doesn't blow up GPU memory.
-        # _compute_pid_loss will move only the PID-active slice [P, T, K] to GPU on demand.
-        if self.config.enable_pid:
-            data.batch.unlock_()
-            for key in ["teacher_topk_log_probs", "teacher_topk_ids", "teacher_log_probs"]:
-                if key in data.batch.keys():
-                    data.batch[key] = data.batch[key].cpu()
 
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
@@ -536,6 +532,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = tqdm(micro_batches, desc="Update policy", position=2)
 
                 for micro_batch in micro_batches:
+                    torch.cuda.empty_cache()  # defragment pool from previous micro-batch's variable-length fwd/bwd
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_probs = model_inputs["old_log_probs"]

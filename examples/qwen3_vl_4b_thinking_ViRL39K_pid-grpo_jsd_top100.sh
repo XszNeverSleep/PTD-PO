@@ -46,6 +46,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     data.max_hint_prompt_length=${MAX_HINT_LENGTH} \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.global_batch_size=${GLOBAL_BATCH_SIZE} \
+    worker.actor.micro_batch_size_per_device_for_update=1 \
     worker.rollout.tensor_parallel_size=1 \
     worker.reward.reward_function=${REWARD_FUNCTION} \
     worker.rollout.n=5 \

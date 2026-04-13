@@ -14,6 +14,8 @@ export PYTHONUNBUFFERED=1
 export RAY_memory_usage_threshold=0.9
 export SWANLAB_DIR=${SAVE_PATH}/swanlog  # Correct env variable name for PAPO_qwen3
 export RAY_DEDUP_LOGS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 
 mkdir -p ${SWANLAB_DIR}  # Ensure directory exists
 
@@ -26,7 +28,7 @@ MAX_PROMPT_LENGTH=4096
 MAX_RESPONSE_LENGTH=2048
 
 
-CONGI_FILE="examples/configs/config_grpo.yaml"
+CONGI_FILE="examples/configs/config_grpo_4b.yaml"
 TRAIN_FILE="/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train/data"
 VAL_FILE="/mnt/llm-plus-public/dataset/PAPO_MMK12_test/data"
 
@@ -55,7 +57,8 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     trainer.save_checkpoint_path=${SAVE_PATH} \
     trainer.val_freq=40 \
     algorithm.disable_kl=True \
-    algorithm.online_filtering=True 
+    algorithm.online_filtering=True \
+    algorithm.enable_pid=false
     
     
 

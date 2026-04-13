@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+"""`
 PPO config
 """
 
@@ -106,6 +106,8 @@ class AlgorithmConfig:
     """Coefficient for PID distillation loss."""
     pid_top_k: int = 64
     """Top-K tokens for Top-K with Tail KL. 0 = single-token KL mode."""
+    pid_kl_penalty: str = "low_var_kl"
+    """KL estimator for PID scalar mode (pid_top_k=0): 'kl', 'abs', 'mse', 'low_var_kl', 'full'."""
     pid_kl_direction: str = "forward_kl"
     """KL direction for PID distillation: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
     use_ori_entropy_loss: bool = False
@@ -184,6 +186,7 @@ class PPOConfig:
         self.worker.actor.enable_pid = self.algorithm.enable_pid
         self.worker.actor.pid_coef = self.algorithm.pid_coef
         self.worker.actor.pid_top_k = self.algorithm.pid_top_k
+        self.worker.actor.pid_kl_penalty = self.algorithm.pid_kl_penalty
         self.worker.actor.pid_kl_direction = self.algorithm.pid_kl_direction
         self.worker.actor.use_ori_entropy_loss = self.algorithm.use_ori_entropy_loss
         self.worker.actor.ori_entropy_loss_coef = self.algorithm.ori_entropy_loss_coef

@@ -5,7 +5,7 @@ set -x
 CUDA_IDS=0,1,2,3,4,5,6,7
 N_GPU=8
 
-EXP_NAME=qwen3_vl_2b_thinking_ViRL39K_pid-gspo_jsd_top100
+EXP_NAME=qwen3_vl_2b_thinking_ViRL39K_pid-gspo_token_jsd_top100
 SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm_rl_output/${EXP_NAME}
 PROJECT_NAME=VLM-RL-Xiaomi
 export CUDA_LAUNCH_BLOCKING=1
@@ -43,12 +43,12 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
     data.prompt_with_hint_key=prompt_with_hint \
-    data.max_hint_prompt_length=${MAX_HINT_LENGTH} \
+    data.max_hint_prompt_lealgorithm.enable_pid=trngth=${MAX_HINT_LENGTH} \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.global_batch_size=${GLOBAL_BATCH_SIZE} \
-    worker.actor.clip_ratio_low=0.2 \
-    worker.actor.clip_ratio_high=0.2 \
-    worker.actor.loss_type=gspo \
+    worker.actor.clip_ratio_low=3e-4 \
+    worker.actor.clip_ratio_high=4e-4 \
+    worker.actor.loss_type=gspo_token \
     worker.actor.loss_avg_mode=seq \
     worker.rollout.tensor_parallel_size=1 \
     worker.reward.reward_function=${REWARD_FUNCTION} \
@@ -65,7 +65,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     algorithm.kl_penalty=low_var_kl \
     algorithm.kl_coef=0 \
     algorithm.kl_direction=forward_kl \
-    algorithm.enable_pid=true \
+    ue \
     algorithm.pid_threshold=0.4 \
     algorithm.pid_top_k=100 \
     algorithm.pid_coef=5.0e-2 \

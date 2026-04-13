@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source /workspace/esay_r1/bin/activate)",
+      "Bash(pip show flashinfer)",
+      "Bash(python -c \"import flashinfer\")"
+    ]
+  }
+}

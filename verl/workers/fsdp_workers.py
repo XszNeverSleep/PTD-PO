@@ -598,6 +598,10 @@ class FSDPWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.optimizer)
 
         output = output.to("cpu")
+        # Return backward-pass gradient/activation fragments to CUDA so the next
+        # step's compute_ref_log_probs / compute_teacher_log_probs can find
+        # contiguous blocks for large allocations (e.g., lm_head logits [B,T,V]).
+        torch.cuda.empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -686,9 +690,6 @@ class FSDPWorker(Worker):
             offload_fsdp_model(self.fsdp_module)
 
         output = output.to("cpu")
-        # Release reserved-but-unallocated CUDA memory so update_actor's backward
-        # can find contiguous free blocks instead of fragmenting against teacher temporaries.
-        torch.cuda.empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

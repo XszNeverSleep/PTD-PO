@@ -16,8 +16,8 @@ data:
   override_chat_template: null
   shuffle: true
   seed: 1
-  min_pixels: 262144
-  max_pixels: 4194304
+  max_pixels: 1003520 # 1280*28*28
+  min_pixels: 200704 # 256*28*28
   filter_overlong_prompts: true
 
 algorithm:
@@ -60,8 +60,8 @@ worker:
       enable_cpu_offload: false
       enable_rank0_init: true
     offload:
-      offload_params: false  # true: more CPU memory; false: more GPU memory
-      offload_optimizer: false  # true: more CPU memory; false: more GPU memory
+      offload_params: true  # true: more CPU memory; false: more GPU memory
+      offload_optimizer: true  # true: more CPU memory; false: more GPU memory
 
   rollout:
     n: 5
@@ -83,7 +83,7 @@ worker:
     fsdp:
       torch_dtype: bf16
       enable_full_shard: true
-      enable_cpu_offload: false  # true: more CPU memory; false: more GPU memory
+      enable_cpu_offload: true  # true: more CPU memory; false: more GPU memory
       enable_rank0_init: true
     offload:
       offload_params: false

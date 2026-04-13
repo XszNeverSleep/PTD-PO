@@ -26,7 +26,7 @@ MAX_PROMPT_LENGTH=4096
 MAX_RESPONSE_LENGTH=2048
 
 
-CONGI_FILE="examples/configs/config_grpo.yaml"
+CONGI_FILE="examples/configs/config_grpo_4b.yaml"
 TRAIN_FILE="/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train/data"
 VAL_FILE="/mnt/llm-plus-public/dataset/PAPO_MMK12_test/data"
 
@@ -43,10 +43,10 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.global_batch_size=${GLOBAL_BATCH_SIZE} \
-    worker.actor.loss_type=gspo_token \
+    worker.actor.loss_type=gspo \
     worker.actor.loss_avg_mode=seq \
-    worker.actor.clip_ratio_low=3e-4 \
-    worker.actor.clip_ratio_high=4e-4 \
+    worker.actor.clip_ratio_low=0.2 \
+    worker.actor.clip_ratio_high=0.2 \
     worker.rollout.tensor_parallel_size=1 \
     worker.reward.reward_function=${REWARD_FUNCTION} \
     worker.rollout.n=5 \
