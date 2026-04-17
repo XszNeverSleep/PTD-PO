@@ -5,9 +5,10 @@ set -x
 CUDA_IDS=0,1,2,3,4,5,6,7
 N_GPU=8
 
-EXP_NAME=qwen3_vl_4b_thinking_ViRL39K_pid-grpo_jsd_top100_1e_wo_entropy_reg
-SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm_rl_output/${EXP_NAME}
-PROJECT_NAME=VLM-RL-Xiaomi
+EXP_NAME=qwen3_vl_2b_thinking_ViRL39K_pid-grpo_jsd_top100_5e-1_thr_4e-1
+SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm-rl-xsz/${EXP_NAME}
+PROJECT_NAME=VLM-RL-Xiaomi-xsz
+
 export CUDA_LAUNCH_BLOCKING=1
 export SWANLAB_MODE="offline"
 export PYTHONUNBUFFERED=1
@@ -18,7 +19,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p ${SWANLAB_DIR}  # Ensure directory exists
 
-MODEL_PATH=/mnt/vlm-ks3/fengfeng/model_zoo/Qwen3-VL-4B-Thinking
+MODEL_PATH=/mnt/vlm-ks3/fengfeng/model_zoo/Qwen3-VL-2B-Thinking
 TOTAL_EPOCHES=2
 GLOBAL_BATCH_SIZE=128
 ROLLOUT_BATCH_SIZE=384
@@ -27,7 +28,7 @@ MAX_PROMPT_LENGTH=8192
 MAX_RESPONSE_LENGTH=2048
 MAX_HINT_LENGTH=4096
 
-CONGI_FILE="examples/configs/config_grpo_4b.yaml"
+CONGI_FILE="examples/configs/config_grpo.yaml"
 TRAIN_FILE="/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train_with_hint/data"
 VAL_FILE="/mnt/llm-plus-public/dataset/PAPO_MMK12_test/data"
 
@@ -64,9 +65,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     algorithm.enable_pid=true \
     algorithm.pid_threshold=0.4 \
     algorithm.pid_top_k=100 \
-    algorithm.pid_coef=1.0 \
+    algorithm.pid_coef=5.0e-1 \
     algorithm.pid_kl_direction=jsd_kl \
-    algorithm.use_ori_entropy_loss=false \
-    algorithm.ori_entropy_loss_coef=0.03
 
 

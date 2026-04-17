@@ -16,8 +16,8 @@ data:
   override_chat_template: null
   shuffle: true
   seed: 1
-  min_pixels: 262144
-  max_pixels: 4194304
+  max_pixels: 1003520 # 1280*28*28
+  min_pixels: 200704 # 256*28*28
   filter_overlong_prompts: true
 
 algorithm:
@@ -27,7 +27,7 @@ algorithm:
   kl_penalty: low_var_kl
   kl_coef: 1.0e-2
   online_filtering: false  # dapo filter groups
-  filter_key: overall
+  filter_key: accuracy
   filter_low: 0.01
   filter_high: 0.99
 
@@ -35,7 +35,7 @@ worker:
   actor:
     global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
     micro_batch_size_per_device_for_update: 2  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
-    micro_batch_size_per_device_for_experience: 16  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
+    micro_batch_size_per_device_for_experience: 4  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
     max_grad_norm: 1.0
     padding_free: true
     dynamic_batching: true
@@ -53,20 +53,21 @@ worker:
     optim:
       lr: 1.0e-6
       weight_decay: 1.0e-2
-      strategy: adamw  # {adamw, adamw_bf16}
+      strategy: adamw_bf16  # {adamw, adamw_bf16}
       lr_warmup_ratio: 0.0
     fsdp:
+      torch_dtype: bf16
       enable_full_shard: true
       enable_cpu_offload: false
       enable_rank0_init: true
     offload:
-      offload_params: false  # true: more CPU memory; false: more GPU memory
-      offload_optimizer: false  # true: more CPU memory; false: more GPU memory
+      offload_params: true  # true: more CPU memory; false: more GPU memory
+      offload_optimizer: true  # true: more CPU memory; false: more GPU memory
 
   rollout:
     n: 5
     temperature: 1.0
-    top_p: 1.0
+    top_p: 0.99
     limit_images: 0
     max_num_batched_tokens: 10240
     gpu_memory_utilization: 0.6

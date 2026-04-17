@@ -6,8 +6,8 @@ CUDA_IDS=0,1,2,3,4,5,6,7
 N_GPU=8
 
 EXP_NAME=qwen3_vl_4b_thinking_ViRL39K_dapo
-SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm_rl_output/${EXP_NAME}
-PROJECT_NAME=VLM-RL-Xiaomi
+SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm-rl-xsz/${EXP_NAME}
+PROJECT_NAME=VLM-RL-Xiaomi-xsz
 
 export SWANLAB_MODE="offline"
 export PYTHONUNBUFFERED=1
@@ -28,7 +28,7 @@ MAX_PROMPT_LENGTH=4096
 MAX_RESPONSE_LENGTH=2048
 
 
-CONGI_FILE="examples/configs/config_grpo_4b.yaml"
+CONGI_FILE="examples/configs/config_grpo.yaml"
 TRAIN_FILE="/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train/data"
 VAL_FILE="/mnt/llm-plus-public/dataset/PAPO_MMK12_test/data"
 

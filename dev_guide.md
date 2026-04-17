@@ -17,6 +17,7 @@
    - [4.5 vLLM Rollout 引擎](#45-vllm-rollout-引擎)
    - [4.6 Reward Manager](#46-reward-manager)
    - [4.7 Core Algorithms (优势估计与损失函数)](#47-core-algorithms-优势估计与损失函数)
+   - [4.8 PID-GRPO (Policy-Informed Distillation)](#48-pid-grpo-policy-informed-distillation)
 5. [分布式架构](#5-分布式架构)
    - [5.1 Single Controller + Ray WorkerGroup](#51-single-controller--ray-workergroup)
    - [5.2 Hybrid Engine (FSDP + vLLM)](#52-hybrid-engine-fsdp--vllm)
@@ -140,17 +141,25 @@ Step 5: Reference Log Prob 计算
 Step 6: 值估计 (仅 GAE)
   完整序列 → Critic forward → values            [bs, response_length]
 
-Step 7: KL 惩罚 (可选)
-  token_level_scores += -kl_coef * KL(old_log_probs, ref_log_probs)
+Step 7: PID Mask 计算 (enable_pid=true 时)
+  accuracy_scores + uid → compute_pid_mask(threshold) → pid_mask, pid_group_mask
+  hint_input_ids + responses → Actor eval forward → teacher_topk_log_probs/ids (或 teacher_log_probs)
 
-Step 8: 优势计算
+Step 8: KL 惩罚 (可选)
+  token_level_scores += -kl_coef * KL(old_log_probs, ref_log_probs)
+  PID 组 (pid_group_mask=True) 的 token_level_rewards 不受 ref KL 影响
+
+Step 9: 优势计算
   token_level_rewards + values → AdvantageEstimator → advantages, returns
 
-Step 9: Critic 更新 (仅 GAE)
+Step 10: Critic 更新 (仅 GAE)
   values + returns → value_loss → optimizer.step()
 
-Step 10: Actor 更新
-  old_log_probs + advantages → policy_loss → optimizer.step()
+Step 11: Actor 更新
+  old_log_probs + advantages → policy_loss
+  + kl_coef * kl_loss (PID 组清零)
+  + pid_coef * pid_loss (仅 pid_mask=True 的样本)
+  → optimizer.step()
 ```
 
 ### 训练主循环伪代码 (`ray_trainer.py: RayPPOTrainer.fit()`)
@@ -169,13 +178,20 @@ for epoch in range(total_epochs):
         ref_log_probs = actor_rollout_ref_wg.compute_ref_log_probs(batch)
         values = critic_wg.compute_values(batch)         # 仅 GAE
 
+        # === PID (enable_pid=true 时) ===
+        pid_mask, pid_group_mask = compute_pid_mask(accuracy, uid, threshold)
+        if pid_mask.any():
+            teacher_output = actor_rollout_ref_wg.compute_teacher_log_probs(batch)
+            batch.union(teacher_output)
+
         # === 奖励处理 ===
         apply_kl_penalty(batch)                          # 可选 KL 惩罚
+        # PID 组的 token_level_rewards 回退到原始 scores（不叠加 ref KL）
         compute_advantage(batch, adv_estimator=...)      # 优势估计
 
         # === 模型更新 ===
         critic_wg.update_critic(batch)                   # 仅 GAE
-        actor_rollout_ref_wg.update_actor(batch)         # 策略梯度更新
+        actor_rollout_ref_wg.update_actor(batch)         # 策略梯度 + KL loss + PID loss
 
         # === 验证与保存 ===
         if global_step % val_freq == 0: _validate()
@@ -429,6 +445,154 @@ vf_loss2 = (vpred_clipped - returns)²
 vf_loss  = 0.5 * max(vf_loss1, vf_loss2)
 ```
 
+### 4.8 PID-GRPO (Policy-Informed Distillation)
+
+> `verl/trainer/core_algos.py` + `verl/workers/actor/dp_actor.py` + `verl/trainer/ray_trainer.py`
+
+PID-GRPO 在标准 GRPO 基础上增加了 **在线策略蒸馏**：对于模型做不对的题，用 hint-augmented prompt 喂给同一个 actor（作为 teacher），将 teacher 的输出分布蒸馏回 student，从而在 RL 训练中引入有监督的知识注入。
+
+#### 两种模式
+
+| 参数 | `pid_top_k=100` (Top-K 模式) | `pid_top_k=0` (Single-token 模式) |
+|------|------|------|
+| Teacher 输出 | top-100 的 log_probs + token IDs `[B, T, K]` | 逐 token 的 log_prob `[B, T]` |
+| Student 输出 | 额外计算 top-100 log_probs/probs/IDs | 仅使用已有的 log_probs |
+| KL 计算方式 | `compute_topk_kl`：独立 top-K 集合 + tail 补偿 | `compute_kl`：标准逐 token KL |
+| 显存开销 | 较高（需存储 `[B, T, K]` 张量） | 较低 |
+| 精度 | 更高（近似完整分布 KL） | 较低（仅用单 token log_prob 近似） |
+
+#### 关键配置
+
+```yaml
+algorithm:
+  enable_pid: true            # 开启 PID
+  pid_threshold: 0.2          # 组内正确率 < 20% 时激活 PID
+  pid_top_k: 100              # Top-K token 数 (0 = single-token 模式)
+  pid_coef: 5.0e-2            # PID 蒸馏损失系数
+  pid_kl_direction: jsd_kl    # KL 方向：forward_kl / reverse_kl / jsd_kl
+
+  # Standard ref KL (与 PID 共存但互斥作用于不同 sample)
+  use_kl_loss: true
+  kl_penalty: low_var_kl
+  kl_coef: 1.0e-2
+  kl_direction: forward_kl
+```
+
+#### 数据要求
+
+数据集需包含 `prompt_with_hint` 列（通过 `data.prompt_with_hint_key` 指定），即对原始 prompt 附加了 hint 信息的增强版本。DataLoader 会同时生成：
+- 标准 prompt 的 `input_ids/attention_mask/position_ids`
+- Hint prompt 的 `hint_input_ids/hint_attention_mask/hint_position_ids`
+
+#### 完整执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  ray_trainer.py — 训练主循环 fit()                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Step 1: Rollout + Reward (与标准 GRPO 相同)                            │
+│    vLLM 生成 response → RewardManager 计算 accuracy                     │
+│                                                                         │
+│  Step 2: 计算 PID Mask (core_algos.compute_pid_mask)                    │
+│    对每个 group (uid)：                                                  │
+│    ├─ group_accuracy = 组内 accuracy==1.0 的比例                         │
+│    ├─ 若 group_accuracy < pid_threshold (0.2):                          │
+│    │   ├─ pid_group_mask[所有组内样本] = True                            │
+│    │   └─ pid_mask[组内 accuracy≠1.0 的样本] = True                     │
+│    └─ 额外 AND has_hint：过滤无 hint 数据的样本                          │
+│                                                                         │
+│  Step 3: 计算 Teacher 输出 (dp_actor.compute_teacher_log_prob)          │
+│    ├─ 输入: hint_input_ids + responses (hint prompt 拼接 response)       │
+│    ├─ Actor 模型 eval 模式 forward                                      │
+│    ├─ pid_top_k=100: 返回 teacher_topk_log_probs [B, T, 100]           │
+│    │                       teacher_topk_ids       [B, T, 100]           │
+│    └─ pid_top_k=0:  返回 teacher_log_probs       [B, T]                │
+│    注: 所有 sample 都过 forward (避免 FSDP all-gather 死锁),             │
+│        non-PID 位置结果 * 0 清零                                        │
+│                                                                         │
+│  Step 4: KL Penalty 互斥处理                                           │
+│    ├─ 对 pid_group_mask=True 的样本：                                    │
+│    │   token_level_rewards = token_level_scores (跳过 ref KL penalty)   │
+│    └─ 对其他样本：正常施加 ref KL penalty                                │
+│                                                                         │
+│  Step 5: 优势计算 (与标准 GRPO 相同)                                    │
+│    compute_advantage → GRPO 组内归一化                                   │
+│                                                                         │
+│  Step 6: Actor 更新 (dp_actor.update_policy)                            │
+│    对每个 micro-batch:                                                   │
+│    ├─ Student forward:                                                  │
+│    │   ├─ pid_top_k=100: 额外返回 student top-K (log_probs/probs/ids)  │
+│    │   └─ pid_top_k=0:   仅返回 log_probs                              │
+│    ├─ pg_loss = compute_policy_loss(...)  # 标准 PPO clip loss          │
+│    ├─ kl_loss (use_kl_loss=true):                                       │
+│    │   ├─ kld = compute_kl(actor, ref, low_var_kl, forward_kl)          │
+│    │   └─ kld[pid_group_mask] = 0  # PID 组不受 ref KL 约束            │
+│    ├─ pid_loss (_compute_pid_loss):                                     │
+│    │   ├─ 仅对 pid_mask=True 的样本计算                                  │
+│    │   ├─ pid_top_k=100: compute_topk_kl(student_topK, teacher_topK)   │
+│    │   └─ pid_top_k=0:   compute_kl(student, teacher)                  │
+│    ├─ loss = pg_loss + kl_coef * kl_loss + pid_coef * pid_loss          │
+│    └─ loss.backward() + optimizer.step()                                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Top-K KL with Tail Compensation (`compute_topk_kl`)
+
+> `verl/trainer/core_algos.py:662`
+
+Student 和 Teacher 各自独立计算 top-K，两个 top-K 集合可能不同。跨集合匹配通过 `_topk_match_and_gather` 完成：
+- 命中（token 在对方 top-K 中）：使用对方存储的 log_prob
+- 未命中：假设 tail 均匀分布，用 `log(tail_mass / (vocab_size - K))` 近似
+
+**JSD 模式 (`jsd_kl`) 的 Top-K 计算：**
+
+```python
+# M = 0.5 * (P_student + P_teacher), 均在 student 的 top-K 支撑上评估
+m_probs = 0.5 * (student_topk_probs + teacher_probs_at_student)     # [B, T, K]
+m_tail  = 0.5 * (p_tail_student + p_tail_teacher)                   # [B, T]
+
+# JSD = 0.5 * KL(S || M) + 0.5 * KL(T || M)
+kl_s_m = (S_probs.detach() * (S_log_probs - log(M))).sum(-1) + tail_s  # stop-grad on weight
+kl_t_m = (T_probs         * (T_log_probs - log(M))).sum(-1) + tail_t
+jsd    = 0.5 * (kl_s_m + kl_t_m)                                   # [B, T]
+```
+
+注: JSD 中对 `S_probs` 的 weight 做了 `detach()`，避免当 `p_s → 0` 时梯度爆炸。
+
+#### PID Mask 逻辑详解 (`compute_pid_mask`)
+
+> `verl/trainer/core_algos.py:733`
+
+```
+假设 group n=5, pid_threshold=0.2:
+
+Group A: [正确, 错误, 错误, 错误, 错误]  → accuracy=0.2 → < 0.2? No  → 不激活
+Group B: [错误, 错误, 错误, 错误, 错误]  → accuracy=0.0 → < 0.2? Yes → 激活
+  └─ pid_group_mask: 全组 True (5个)
+  └─ pid_mask:       仅 accuracy≠1.0 的 True (5个, 因为全错)
+
+Group C: [正确, 正确, 错误, 错误, 错误]  → accuracy=0.4 → < 0.2? No  → 不激活
+```
+
+两个 mask 的不同作用：
+- `pid_mask`: 决定哪些样本接受 PID 蒸馏损失（仅答错的样本）
+- `pid_group_mask`: 决定哪些样本跳过 ref KL penalty（整个 PID 组的所有样本，包括答对的）
+
+#### Metrics
+
+| Metric | 说明 |
+|--------|------|
+| `pid/pid_groups` | 激活 PID 的 group 数 |
+| `pid/total_groups` | 总 group 数 |
+| `pid/pid_trajectories` | PID mask 为 True 的样本数 |
+| `pid/mask_ratio` | PID mask 占比 |
+| `pid/group_mask_ratio` | PID group mask 占比 |
+| `actor/pid_kl` | PID KL 散度（未乘系数） |
+| `actor/pid_loss` | PID 损失（已乘 pid_coef） |
+| `actor/pid_ratio` | 当前 micro-batch 中 PID 样本占比 |
+
 ---
 
 ## 5. 分布式架构
@@ -522,6 +686,12 @@ Hybrid Engine 的核心思想是在同一组 GPU 上交替运行 FSDP 和 vLLM�
 {"prompt": "带视频的<video>问题", "videos": ["path/to/vid.mp4"], "answer": "答案"}
 ```
 
+**PID 模式额外字段** (`prompt_with_hint_key` 非空时)：
+```jsonl
+{"prompt": "原始问题", "prompt_with_hint": "附加了 hint 的问题", "images": [...], "answer": "答案"}
+```
+DataLoader 会同时 tokenize `prompt` 和 `prompt_with_hint`，生成 `hint_input_ids/hint_attention_mask/hint_position_ids`。
+
 **处理流程：**
 
 1. **消息构建** (`_build_messages`): 将 prompt 转换为 chat message 格式
@@ -569,6 +739,8 @@ PPOConfig:
     min_pixels: 262144               # 图片最小像素数
     max_pixels: 4194304              # 图片最大像素数
     filter_overlong_prompts: true
+    prompt_with_hint_key: null       # PID hint prompt 列名 (e.g. "prompt_with_hint")
+    max_hint_prompt_length: null     # hint prompt 最大长度 (默认 = max_prompt_length)
 
   algorithm:                         # 算法配置
     adv_estimator: "grpo"            # gae | grpo | rloo | reinforce_plus_plus | remax
@@ -576,9 +748,17 @@ PPOConfig:
     lam: 1.0                         # GAE lambda
     kl_penalty: "kl"                 # kl | abs | mse | low_var_kl | full
     kl_coef: 0.001
+    kl_direction: "reverse_kl"      # reverse_kl | forward_kl | jsd_kl
     disable_kl: false                # 禁用 reference model
     use_kl_loss: false               # KL 作为损失 vs 作为奖励惩罚
     online_filtering: false          # 在线过滤
+    # --- PID-GRPO ---
+    enable_pid: false                # 开启 PID 在线蒸馏
+    pid_threshold: 1.0               # 组内正确率阈值 (< threshold 激活)
+    pid_coef: 1.0                    # PID 损失系数
+    pid_top_k: 64                    # Top-K token 数 (0 = single-token 模式)
+    pid_kl_penalty: "low_var_kl"     # PID single-token 模式的 KL 估计器
+    pid_kl_direction: "forward_kl"   # PID KL 方向: forward_kl | reverse_kl | jsd_kl
 
   trainer:                           # 训练器配置
     total_epochs: 15
@@ -711,7 +891,8 @@ global_step_100/
 | **Actor 更新** | `actor/pg_loss`, `actor/pg_clipfrac`, `actor/pg_ratio`, `actor/entropy` |
 | **Critic 更新** | `critic/vf_loss`, `critic/vf_clipfrac` |
 | **KL** | `critic/kl/mean`, `critic/kl_coef` |
-| **耗时** | `timing_s/{gen,reward,log_probs,ref_log_probs,values,adv,update_actor,update_critic}` |
+| **PID** | `pid/{pid_groups,total_groups,pid_trajectories,mask_ratio,group_mask_ratio}`, `actor/{pid_kl,pid_loss,pid_ratio}` |
+| **耗时** | `timing_s/{gen,reward,log_probs,ref_log_probs,values,adv,teacher,update_actor,update_critic}` |
 | **吞吐** | `perf/total_num_tokens`, `perf/time_per_step`, `perf/throughput` (tokens/s/GPU) |
 
 ### 支持的日志后端

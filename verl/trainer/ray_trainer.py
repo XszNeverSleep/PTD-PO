@@ -559,6 +559,7 @@ class RayPPOTrainer:
                 print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
+                    metrics["_raw_reward_metrics"] = dict(all_metrics)
 
                 return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
 
@@ -637,15 +638,16 @@ class RayPPOTrainer:
                     else:
                         reward_metrics_raw = None
 
+                    # Collect accuracy list for PID mask / monitoring
+                    if reward_metrics_raw is not None:
+                        accuracy_list = reward_metrics_raw.get("accuracy", None)
+                    elif "_raw_reward_metrics" in metrics:
+                        accuracy_list = metrics["_raw_reward_metrics"].get("accuracy", None)
+                    else:
+                        accuracy_list = None
+
                     # Compute PID mask if PID is enabled and hint data is available
                     if self.config.algorithm.enable_pid and "hint_input_ids" in batch.batch:
-                        # Get raw accuracy list from reward metrics
-                        if reward_metrics_raw is not None:
-                            accuracy_list = reward_metrics_raw.get("accuracy", None)
-                        else:
-                            # online_filtering case: accuracy was accumulated in all_metrics earlier
-                            accuracy_list = all_metrics.get("accuracy", None)
-
                         if accuracy_list is None:
                             print("Warning: PID requires 'accuracy' in reward scores. Skipping PID for this step.")
                         else:
@@ -680,6 +682,25 @@ class RayPPOTrainer:
                                 with timer("teacher", timing_raw):
                                     teacher_output = self.actor_rollout_ref_wg.compute_teacher_log_probs(batch)
                                     batch = batch.union(teacher_output)
+
+                    elif accuracy_list is not None and "uid" in batch.non_tensor_batch \
+                            and len(accuracy_list) == len(batch.non_tensor_batch["uid"]):
+                        # Monitor-only: log PID-style group statistics without activating PID
+                        accuracy_scores = torch.tensor(accuracy_list, dtype=torch.float32)
+                        pid_mask, pid_group_mask = compute_pid_mask(
+                            accuracy_scores, batch.non_tensor_batch["uid"],
+                            self.config.algorithm.pid_threshold,
+                        )
+                        uids = batch.non_tensor_batch["uid"]
+                        pid_groups = len(set(uids[i] for i in range(len(uids)) if pid_group_mask[i]))
+                        total_groups = len(set(uids))
+                        metrics["pid/pid_groups"] = pid_groups
+                        metrics["pid/total_groups"] = total_groups
+                        metrics["pid/pid_trajectories"] = pid_mask.sum().item()
+                        metrics["pid/pid_group_trajectories"] = pid_group_mask.sum().item()
+                        metrics["pid/total_trajectories"] = pid_mask.numel()
+                        metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
+                        metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
 
                     # apply kl penalty if available
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
@@ -746,6 +767,7 @@ class RayPPOTrainer:
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 
+            metrics.pop("_raw_reward_metrics", None)
             self.logger.log(data=metrics, step=self.global_step)
             main_tqdm.update()
 
