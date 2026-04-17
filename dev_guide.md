@@ -470,6 +470,7 @@ algorithm:
   pid_top_k: 100              # Top-K token 数 (0 = single-token 模式)
   pid_coef: 5.0e-2            # PID 蒸馏损失系数
   pid_kl_direction: jsd_kl    # KL 方向：forward_kl / reverse_kl / jsd_kl
+  pid_all_trajectories: false # true = 对 PID 组内所有轨迹蒸馏（含正确的）; false = 仅错误轨迹
 
   # Standard ref KL (与 PID 共存但互斥作用于不同 sample)
   use_kl_loss: true
@@ -538,13 +539,86 @@ algorithm:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+#### Top-K 模式实现细节 (`pid_top_k > 0`)
+
+当 `pid_top_k > 0`（如 100）时，PID 不使用逐 token 的单一 log_prob，而是比较 student 和 teacher 的 top-K 分布。
+这种方式更接近完整分布的 KL，但需要额外处理显存和跨集合匹配问题。
+
+**端到端数据流：**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  1. Teacher 端 (compute_teacher_log_prob → _forward_teacher)            │
+│     hint_prompt + response → model forward → logits [P, T, V]          │
+│     → torch.topk(logits, K) → topk_ids [P, T, K]                      │
+│     → logsumexp + gather → topk_log_probs [P, T, K]   (避免 full softmax)│
+│     → 存入 batch: teacher_topk_log_probs, teacher_topk_ids (detached)  │
+│                                                                         │
+│  2. Student 端 (update_policy → _forward_micro_batch)                   │
+│     input_ids → model forward → logits [N, V] (unpadded)               │
+│     → torch.utils.checkpoint.checkpoint(_compact_fn, logits):           │
+│       ├─ log_softmax(logits) → log_probs_full [N, V]                   │
+│       ├─ topk(logits, K) → idx [N, K]                                  │
+│       ├─ gather(log_probs_full, idx) → topk_lp [N, K]                  │
+│       └─ topk_lp.exp() → topk_p [N, K]                                │
+│     → pad_input → [B, T, K] 的 topk_log_probs, topk_probs, topk_ids   │
+│                                                                         │
+│  3. PID Loss (_compute_pid_loss → compute_topk_kl)                     │
+│     student top-K (with grad) + teacher top-K (detached)               │
+│     → _topk_match_and_gather 交叉匹配                                  │
+│     → Top-K KL with tail compensation → scalar loss                    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Teacher 端显存优化** (`dp_actor.py:_forward_teacher`)：
+- 不使用 padding-free 模式（简化实现），直接 padded forward
+- `output.logits[:, -T-1:-1, :].detach().clone()` 后立即 `del output`，只保留 response 部分
+- 计算 top-K 时用 `logsumexp` + `gather` 替代完整 softmax，避免 `[P, T, V]` 的 float32 张量
+- 每个 micro-batch 后调用 `torch.cuda.empty_cache()` 回收碎片
+
+**Student 端显存优化** (`dp_actor.py:_forward_micro_batch`)：
+- 使用 `torch.utils.checkpoint.checkpoint` 包裹 top-K 计算，反向传播时重算 `[N, V]` 的 softmax，避免保存在前向图中
+- 在 padding-free 模式下，先在 unpadded 空间 `(total_nnz, V)` 上计算 top-K，再 `pad_input` 回 `[B, T, K]`——K 维很小，pad 开销低
+
+**FSDP 死锁预防** (`dp_actor.py:compute_teacher_log_prob`)：
+- Teacher forward 必须处理**所有** batch（不仅是 PID 样本），因为 FSDP all-gather 要求所有 rank 执行相同次数的 forward
+- Non-PID 位置的结果通过 `pid_mask * tensor` 清零，下游不会读取
+
 #### Top-K KL with Tail Compensation (`compute_topk_kl`)
 
 > `verl/trainer/core_algos.py:662`
 
-Student 和 Teacher 各自独立计算 top-K，两个 top-K 集合可能不同。跨集合匹配通过 `_topk_match_and_gather` 完成：
-- 命中（token 在对方 top-K 中）：使用对方存储的 log_prob
-- 未命中：假设 tail 均匀分布，用 `log(tail_mass / (vocab_size - K))` 近似
+Student 和 Teacher 各自独立计算 top-K，两个 top-K 集合可能不同（如 student 把 token A 排在 top-K 但 teacher 没有）。跨集合匹配通过 `_topk_match_and_gather` 完成：
+
+**`_topk_match_and_gather` 匹配算法** (`core_algos.py:628`)：
+```python
+# 输入: query_ids [B, T, K], key_topk_log_probs [B, T, M], key_topk_ids [B, T, M]
+# 目标: 对 query 中的每个 token，在 key 的 top-M 中查找对应的 log_prob
+
+match = query_ids[:,:,:,None] == key_topk_ids[:,:,None,:]  # [B, T, K, M] 广播比较
+lp_matched = (match * key_topk_log_probs).sum(-1)          # 命中 → 取 key 的 log_prob
+has_match = match.any(-1)                                    # [B, T, K] 是否命中
+
+# 未命中 → tail 均匀近似: log(tail_mass / (vocab_size - M))
+key_tail_mass = 1.0 - key_topk_probs.sum(-1)               # [B, T]
+miss_lp = log(tail_mass) - log(150000 - M)                  # 假设 vocab ≈ 150K
+
+result = where(has_match, lp_matched, miss_lp)              # [B, T, K]
+```
+
+**KL 计算（以 student 的 top-K 为支撑集）：**
+```python
+# 先用 _topk_match_and_gather 获取 teacher 在 student top-K 位置的 log_probs
+teacher_lp_at_student = _topk_match_and_gather(student_ids, teacher_lp, teacher_ids)  # [B,T,K]
+
+# 计算 tail mass
+p_tail_s = 1 - student_probs.sum(-1)   # student top-K 外的概率质量
+p_tail_t = 1 - teacher_probs_at_student.sum(-1)  # teacher 在 student 支撑集上的 tail
+
+# Forward KL: KL(S||T) = Σ_k p_s[k] * (log p_s[k] - log p_t[k]) + p_tail_s * log(p_tail_s/p_tail_t)
+# Reverse KL: KL(T||S), 交换 P 和 Q
+# JSD: 0.5 * KL(S||M) + 0.5 * KL(T||M), M = 0.5 * (S + T)
+```
 
 **JSD 模式 (`jsd_kl`) 的 Top-K 计算：**
 
@@ -577,8 +651,8 @@ Group C: [正确, 正确, 错误, 错误, 错误]  → accuracy=0.4 → < 0.2? N
 ```
 
 两个 mask 的不同作用：
-- `pid_mask`: 决定哪些样本接受 PID 蒸馏损失（仅答错的样本）
-- `pid_group_mask`: 决定哪些样本跳过 ref KL penalty（整个 PID 组的所有样本，包括答对的）
+- `pid_mask`: 决定哪些样本接受 PID 蒸馏损失。默认仅答错的样本；当 `pid_all_trajectories=true` 时，PID 组内所有样本（含正确的）都接受蒸馏
+- `pid_group_mask`: 决定哪些样本跳过 ref KL penalty（整个 PID 组的所有样本，包括答对的，不受 `pid_all_trajectories` 影响）
 
 #### Metrics
 
@@ -759,6 +833,7 @@ PPOConfig:
     pid_top_k: 64                    # Top-K token 数 (0 = single-token 模式)
     pid_kl_penalty: "low_var_kl"     # PID single-token 模式的 KL 估计器
     pid_kl_direction: "forward_kl"   # PID KL 方向: forward_kl | reverse_kl | jsd_kl
+    pid_all_trajectories: false      # true = 对 PID 组内所有轨迹蒸馏; false = 仅错误轨迹
 
   trainer:                           # 训练器配置
     total_epochs: 15

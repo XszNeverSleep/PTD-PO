@@ -5,7 +5,7 @@ set -x
 CUDA_IDS=0,1,2,3,4,5,6,7
 N_GPU=8
 
-EXP_NAME=qwen3_vl_2b_thinking_ViRL39K_pid-grpo_jsd_top100_5e-1_thr_1
+EXP_NAME=qwen3_vl_2b_thinking_ViRL39K_pid-grpo_jsd_top100_thr_1_all
 SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm-rl-xsz/${EXP_NAME}
 PROJECT_NAME=VLM-RL-Xiaomi-xsz
 
@@ -65,7 +65,8 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     algorithm.enable_pid=true \
     algorithm.pid_threshold=1.0 \
     algorithm.pid_top_k=100 \
-    algorithm.pid_coef=5.0e-1 \
+    algorithm.pid_coef=5.0e-2 \
     algorithm.pid_kl_direction=jsd_kl \
+    algorithm.pid_all_trajectories=true
 
 

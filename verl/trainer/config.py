@@ -110,6 +110,8 @@ class AlgorithmConfig:
     """KL estimator for PID scalar mode (pid_top_k=0): 'kl', 'abs', 'mse', 'low_var_kl', 'full'."""
     pid_kl_direction: str = "forward_kl"
     """KL direction for PID distillation: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
+    pid_all_trajectories: bool = False
+    """When True, apply PID distillation to ALL trajectories in PID groups (including correct ones). Default: only incorrect."""
     use_ori_entropy_loss: bool = False
     """Add original-policy entropy bonus on PID-active samples: -E[log π(a|s)]."""
     ori_entropy_loss_coef: float = 0.0

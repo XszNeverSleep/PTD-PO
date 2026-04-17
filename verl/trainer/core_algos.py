@@ -734,20 +734,25 @@ def compute_pid_mask(
     accuracy_scores: torch.Tensor,
     group_index: np.ndarray,
     pid_threshold: float,
+    pid_all_trajectories: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Determine which samples get PID distillation.
 
     PID activates for groups where group accuracy < pid_threshold.
-    Within such groups, only incorrect trajectories receive PID loss,
+    Within such groups, only incorrect trajectories receive PID loss by default,
     but ALL samples in these groups skip standard ref KL.
+
+    When pid_all_trajectories=True, ALL trajectories in PID groups (including
+    correct ones) receive PID distillation loss.
 
     Args:
         accuracy_scores: [B] per-sample accuracy (0.0 or 1.0)
         group_index: [B] group uid (np.ndarray of object)
         pid_threshold: float — group accuracy threshold
+        pid_all_trajectories: bool — if True, PID loss applies to all trajectories in PID groups
 
     Returns:
-        pid_mask: [B] bool. True = receives PID loss (incorrect in PID group)
+        pid_mask: [B] bool. True = receives PID loss
         pid_group_mask: [B] bool. True = in PID group (skips ref KL, both correct and incorrect)
     """
     bsz = accuracy_scores.shape[0]
@@ -765,7 +770,7 @@ def compute_pid_mask(
         if group_accuracy < pid_threshold:
             for idx, acc in zip(id2indices[uid], id2acc[uid]):
                 pid_group_mask[idx] = True
-                if acc != 1.0:
+                if pid_all_trajectories or acc != 1.0:
                     pid_mask[idx] = True
 
     return pid_mask, pid_group_mask

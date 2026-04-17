@@ -659,6 +659,7 @@ class RayPPOTrainer:
                             pid_mask, pid_group_mask = compute_pid_mask(
                                 accuracy_scores, batch.non_tensor_batch["uid"],
                                 self.config.algorithm.pid_threshold,
+                                pid_all_trajectories=self.config.algorithm.pid_all_trajectories,
                             )
                             pid_mask = pid_mask & has_hint  # Exclude samples without valid hint data
                             pid_group_mask = pid_group_mask & has_hint
@@ -690,6 +691,7 @@ class RayPPOTrainer:
                         pid_mask, pid_group_mask = compute_pid_mask(
                             accuracy_scores, batch.non_tensor_batch["uid"],
                             self.config.algorithm.pid_threshold,
+                            pid_all_trajectories=self.config.algorithm.pid_all_trajectories,
                         )
                         uids = batch.non_tensor_batch["uid"]
                         pid_groups = len(set(uids[i] for i in range(len(uids)) if pid_group_mask[i]))

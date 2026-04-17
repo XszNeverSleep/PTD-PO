@@ -5,10 +5,10 @@ set -x
 CUDA_IDS=0,1,2,3,4,5,6,7
 N_GPU=8
 
-EXP_NAME=qwen3_vl_4b_thinking_ViRL39K_pid-grpo_jsd_top100_1e_thr_1_all
+EXP_NAME=qwen3_vl_8b_thinking_ViRL39K_pid-grpo_jsd_top100_1e_thr_1
 SAVE_PATH=/mnt/vlm-ks3/xiangshizhe/vlm-rl-xsz/${EXP_NAME}
 PROJECT_NAME=VLM-RL-Xiaomi-xsz
-export CUDA_LAUNCH_BLOCKING=1
+
 export SWANLAB_MODE="offline"
 export PYTHONUNBUFFERED=1
 export RAY_memory_usage_threshold=0.9
@@ -16,16 +16,17 @@ export SWANLAB_DIR=${SAVE_PATH}/swanlog  # Correct env variable name for PAPO_qw
 export RAY_DEDUP_LOGS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+
 mkdir -p ${SWANLAB_DIR}  # Ensure directory exists
 
-MODEL_PATH=/mnt/vlm-ks3/fengfeng/model_zoo/Qwen3-VL-4B-Thinking
+MODEL_PATH=/mnt/vlm-ks3/fengfeng/model_zoo/Qwen3-VL-8B-Thinking
 TOTAL_EPOCHES=2
 GLOBAL_BATCH_SIZE=128
 ROLLOUT_BATCH_SIZE=384
 VAL_BATCH_SIZE=512
-MAX_PROMPT_LENGTH=8192
+MAX_PROMPT_LENGTH=4096
 MAX_RESPONSE_LENGTH=2048
-MAX_HINT_LENGTH=4096
+
 
 CONGI_FILE="examples/configs/config_grpo.yaml"
 TRAIN_FILE="/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train_with_hint/data"
@@ -43,10 +44,8 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
     data.prompt_with_hint_key=prompt_with_hint \
-    data.max_hint_prompt_length=${MAX_HINT_LENGTH} \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.global_batch_size=${GLOBAL_BATCH_SIZE} \
-    worker.actor.micro_batch_size_per_device_for_update=1 \
     worker.rollout.tensor_parallel_size=1 \
     worker.reward.reward_function=${REWARD_FUNCTION} \
     worker.rollout.n=5 \
@@ -56,17 +55,13 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     trainer.total_epochs=${TOTAL_EPOCHES} \
     trainer.save_checkpoint_path=${SAVE_PATH} \
     trainer.val_freq=40 \
-    trainer.val_before_train=False \
-    algorithm.disable_kl=false \
-    algorithm.use_kl_loss=true \
-    algorithm.kl_penalty=low_var_kl \
-    algorithm.kl_coef=1.0e-2 \
-    algorithm.kl_direction=forward_kl \
     algorithm.enable_pid=true \
     algorithm.pid_threshold=1.0 \
     algorithm.pid_top_k=100 \
     algorithm.pid_coef=1.0 \
     algorithm.pid_kl_direction=jsd_kl \
-    algorithm.pid_all_trajectories=true
-
+    algorithm.use_ori_entropy_loss=false \
+    algorithm.ori_entropy_loss_coef=0.03
+    
+    
 
