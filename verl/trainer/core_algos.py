@@ -730,6 +730,61 @@ def compute_topk_kl(
     raise ValueError(f"Unknown kl_direction: {kl_direction}")
 
 
+def compute_full_vocab_kl(
+    student_all_log_probs: torch.Tensor,
+    teacher_all_log_probs: torch.Tensor,
+    kl_direction: str = "forward_kl",
+    seq_chunk_size: int = 64,
+) -> torch.Tensor:
+    """Exact KL divergence over the full vocabulary.
+
+    Processes the sequence dimension in chunks to avoid holding multiple
+    [B, T, V] intermediate tensors on GPU simultaneously.  The teacher tensor
+    may reside on CPU — each chunk is moved to the student's device on the fly.
+
+    Args:
+        student_all_log_probs: [B, T, V] student log-softmax (with grad, on GPU)
+        teacher_all_log_probs: [B, T, V] teacher log-softmax (detached, may be CPU)
+        kl_direction: 'forward_kl', 'reverse_kl', or 'jsd_kl'
+        seq_chunk_size: number of token positions processed per chunk
+
+    Returns:
+        kl: [B, T] per-token KL divergence summed over vocab
+    """
+    teacher_all_log_probs = teacher_all_log_probs.detach()
+    device = student_all_log_probs.device
+    T = student_all_log_probs.size(1)
+
+    kl_chunks = []
+    for t0 in range(0, T, seq_chunk_size):
+        t1 = min(t0 + seq_chunk_size, T)
+        # Slice creates a view for the student (grad preserved);
+        # teacher chunk is moved to GPU only for this iteration.
+        s_lp = student_all_log_probs[:, t0:t1, :].float()          # [B, c, V]
+        t_lp = teacher_all_log_probs[:, t0:t1, :].to(device).float()  # [B, c, V]
+
+        if kl_direction == "forward_kl":
+            s_p = s_lp.exp()
+            kl = (s_p * (s_lp - t_lp)).sum(-1)
+        elif kl_direction == "reverse_kl":
+            t_p = t_lp.exp()
+            kl = (t_p * (t_lp - s_lp)).sum(-1)
+        elif kl_direction == "jsd_kl":
+            s_p = s_lp.exp()
+            t_p = t_lp.exp()
+            m_p = 0.5 * (s_p + t_p)
+            m_lp = m_p.clamp(min=1e-10).log()
+            kl_s_m = (s_p.detach() * (s_lp - m_lp)).sum(-1)
+            kl_t_m = (t_p * (t_lp - m_lp)).sum(-1)
+            kl = 0.5 * (kl_s_m + kl_t_m)
+        else:
+            raise ValueError(f"Unknown kl_direction: {kl_direction}")
+
+        kl_chunks.append(kl)  # [B, c]
+
+    return torch.cat(kl_chunks, dim=1)  # [B, T]
+
+
 def compute_pid_mask(
     accuracy_scores: torch.Tensor,
     group_index: np.ndarray,

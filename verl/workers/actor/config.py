@@ -146,6 +146,8 @@ class ActorConfig:
     pid_kl_direction: str = field(default="forward_kl", init=False)
     use_ori_entropy_loss: bool = field(default=False, init=False)
     ori_entropy_loss_coef: float = field(default=0.0, init=False)
+    enable_opsd: bool = field(default=False, init=False)
+    opsd_coef: float = field(default=1.0, init=False)
 
 
 @dataclass
@@ -159,3 +161,4 @@ class RefConfig:
     dynamic_batching: bool = field(default=False, init=False)
     ulysses_size: int = field(default=1, init=False)
     use_torch_compile: bool = field(default=True, init=False)
+    pid_top_k: int = field(default=0, init=False)

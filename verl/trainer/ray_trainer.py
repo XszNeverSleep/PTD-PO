@@ -236,6 +236,7 @@ class RayPPOTrainer:
         if (
             config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
             and config.worker.rollout.n == 1
+            and not config.algorithm.enable_opsd  # OPSD doesn't need grouping
         ):
             raise ValueError("GRPO and RLOO algorithm need `config.worker.rollout.n > 1`.")
 
@@ -611,13 +612,14 @@ class RayPPOTrainer:
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
-                # recompute old_log_probs
-                with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
+                # recompute old_log_probs (skip for OPSD — no importance sampling needed)
+                if not self.config.algorithm.enable_opsd:
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
 
-                # compute ref_log_probs
-                if self.use_reference_policy:
+                # compute ref_log_probs (skip for OPSD — ref model is used as teacher instead)
+                if self.use_reference_policy and not self.config.algorithm.enable_opsd:
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
@@ -677,11 +679,14 @@ class RayPPOTrainer:
                             metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
                             metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
 
-                            # Compute teacher outputs with old-policy weights — once, before update_actor.
+                            # Compute teacher outputs — once, before update_actor.
                             # Results are union-ed into batch so update_policy can split them per mini-batch.
                             if pid_mask.any():
                                 with timer("teacher", timing_raw):
-                                    teacher_output = self.actor_rollout_ref_wg.compute_teacher_log_probs(batch)
+                                    if self.config.algorithm.pid_use_ref_teacher and self.use_reference_policy:
+                                        teacher_output = self.actor_rollout_ref_wg.compute_ref_teacher_log_probs(batch)
+                                    else:
+                                        teacher_output = self.actor_rollout_ref_wg.compute_teacher_log_probs(batch)
                                     batch = batch.union(teacher_output)
 
                     elif accuracy_list is not None and "uid" in batch.non_tensor_batch \
@@ -704,33 +709,56 @@ class RayPPOTrainer:
                         metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
                         metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
 
-                    # apply kl penalty if available
-                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
-                        batch, kl_metrics = apply_kl_penalty(
-                            batch, self.kl_ctrl,
-                            self.config.algorithm.kl_penalty,
-                            self.config.algorithm.kl_direction,
-                        )
-                        metrics.update(kl_metrics)
+                    # OPSD mode: ALL samples get distillation, teacher = frozen ref model
+                    if self.config.algorithm.enable_opsd and "hint_input_ids" in batch.batch:
+                        has_hint = batch.batch["hint_attention_mask"].sum(dim=-1) > 0  # [B] bool
 
-                        # Zero out KL penalty for PID groups (PID replaces ref KL entirely)
-                        if self.config.algorithm.enable_pid and "pid_group_mask" in batch.batch:
-                            pid_m = batch.batch["pid_group_mask"].unsqueeze(-1).float()  # [B, 1]
-                            batch.batch["token_level_rewards"] = (
-                                batch.batch["token_level_rewards"] * (1 - pid_m)
-                                + batch.batch["token_level_scores"] * pid_m
-                            )
+                        # OPSD: all samples with valid hints get distillation
+                        pid_mask = has_hint
+                        pid_group_mask = has_hint
+                        batch.batch["pid_mask"] = pid_mask
+                        batch.batch["pid_group_mask"] = pid_group_mask
+
+                        metrics["opsd/mask_ratio"] = pid_mask.float().mean().item()
+                        metrics["opsd/active_samples"] = pid_mask.sum().item()
+
+                        # Teacher forward using FROZEN ref model
+                        if pid_mask.any():
+                            with timer("teacher", timing_raw):
+                                teacher_output = self.actor_rollout_ref_wg.compute_ref_teacher_log_probs(batch)
+                                batch = batch.union(teacher_output)
+
+                    if self.config.algorithm.enable_opsd:
+                        # OPSD: no advantage needed, skip KL penalty and advantage computation
+                        pass
                     else:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        # apply kl penalty if available
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            # apply kl penalty to reward
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch, self.kl_ctrl,
+                                self.config.algorithm.kl_penalty,
+                                self.config.algorithm.kl_direction,
+                            )
+                            metrics.update(kl_metrics)
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
+                            # Zero out KL penalty for PID groups (PID replaces ref KL entirely)
+                            if self.config.algorithm.enable_pid and "pid_group_mask" in batch.batch:
+                                pid_m = batch.batch["pid_group_mask"].unsqueeze(-1).float()  # [B, 1]
+                                batch.batch["token_level_rewards"] = (
+                                    batch.batch["token_level_rewards"] * (1 - pid_m)
+                                    + batch.batch["token_level_scores"] * pid_m
+                                )
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
 
                 # update critic
                 if self.use_critic:
@@ -765,7 +793,15 @@ class RayPPOTrainer:
 
             # collect metrics
             num_gpus = self.resource_pool_manager.get_num_gpus()
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            if not self.config.algorithm.enable_opsd:
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            else:
+                # OPSD has no advantages/rewards — only log score
+                if "token_level_scores" in batch.batch.keys():
+                    seq_score = batch.batch["token_level_scores"].sum(-1)
+                    metrics["critic/score/mean"] = torch.mean(seq_score).detach().item()
+                    metrics["critic/score/max"] = torch.max(seq_score).detach().item()
+                    metrics["critic/score/min"] = torch.min(seq_score).detach().item()
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 

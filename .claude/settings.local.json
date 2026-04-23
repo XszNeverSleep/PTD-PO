@@ -3,7 +3,8 @@
     "allow": [
       "Bash(source /workspace/esay_r1/bin/activate)",
       "Bash(pip show flashinfer)",
-      "Bash(python -c \"import flashinfer\")"
+      "Bash(python -c \"import flashinfer\")",
+      "Bash(python3 -c \"\nimport pandas as pd\ndf = pd.read_parquet\\(''/mnt/llm-plus-public/dataset/PAPO_ViRL39K_train_with_cot/data/train-00000-of-00006.parquet''\\)\nprint\\(''Columns:'', list\\(df.columns\\)\\)\nprint\\(''Shape:'', df.shape\\)\nprint\\(''---''\\)\nfor col in df.columns:\n    v = df[col].iloc[0]\n    if isinstance\\(v, str\\):\n        print\\(f''{col}: {repr\\(v[:200]\\)}...''\\)\n    else:\n        print\\(f''{col}: {repr\\(v\\)}''\\)\n\")"
     ]
   }
 }

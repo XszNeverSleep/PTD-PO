@@ -28,7 +28,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss, compute_topk_kl
+from ...trainer.core_algos import average_loss, compute_full_vocab_kl, compute_kl, compute_policy_loss, compute_topk_kl
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
 from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -75,6 +75,7 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batch: dict with input_ids, attention_mask, position_ids, responses, etc.
             temperature: sampling temperature for logits scaling
             pid_top_k: if > 0, also compute student top-K distribution for PID.
+                        if < 0, compute full-vocab log_probs [B, T, V] (with grad).
 
         Returns:
             log_probs: [B, resp_len] when pid_top_k == 0
@@ -82,6 +83,8 @@ class DataParallelPPOActor(BasePPOActor):
                 topk_log_probs: [B, resp_len, K] — top-K log-softmax values (with grad)
                 topk_probs:     [B, resp_len, K] — top-K softmax probs (with grad)
                 topk_ids:       [B, resp_len, K] — top-K token indices (detached)
+            (log_probs, all_log_probs) when pid_top_k < 0
+                all_log_probs:  [B, resp_len, V] — full-vocab log-softmax (with grad)
         """
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape
@@ -192,6 +195,27 @@ class DataParallelPPOActor(BasePPOActor):
                 topk_probs = full_topk_p[:, -response_length - 1 : -1, :]
                 topk_ids = full_topk_idx[:, -response_length - 1 : -1, :]
                 return log_probs, topk_log_probs, topk_probs, topk_ids
+            elif pid_top_k < 0:
+                # Full-vocab mode: return [B, resp_len, V] log_probs with grad
+                logits_for_full = logits_rmpad
+                if self.config.ulysses_size > 1:
+                    logits_for_full = gather_outputs_and_unpad(
+                        logits_for_full, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                    )  # (total_nnz, V)
+
+                # Checkpoint to avoid holding (total_nnz, V) float32 for backward
+                def _full_vocab_fn(lgts):
+                    return torch.nn.functional.log_softmax(lgts.float(), dim=-1)  # (N, V)
+
+                all_lp_rmpad = torch.utils.checkpoint.checkpoint(
+                    _full_vocab_fn, logits_for_full, use_reentrant=False
+                )  # (total_nnz, V)
+
+                full_all_lp = pad_input(
+                    hidden_states=all_lp_rmpad, indices=indices, batch=batch_size, seqlen=seqlen
+                )  # (bsz, seqlen, V)
+                all_log_probs = full_all_lp[:, -response_length - 1 : -1, :]  # (bsz, resp_len, V)
+                return log_probs, all_log_probs
         else:
             output = self.actor_module(
                 input_ids=input_ids,
@@ -220,6 +244,15 @@ class DataParallelPPOActor(BasePPOActor):
                     _compact_fn, logits, use_reentrant=False
                 )
                 return log_probs, topk_log_probs, topk_probs, topk_ids
+            elif pid_top_k < 0:
+                # Full-vocab mode: checkpoint to recompute on backward
+                def _full_vocab_fn(lgts):
+                    return torch.nn.functional.log_softmax(lgts.float(), dim=-1)  # [B, T, V]
+
+                all_log_probs = torch.utils.checkpoint.checkpoint(
+                    _full_vocab_fn, logits, use_reentrant=False
+                )  # [B, T, V]
+                return log_probs, all_log_probs
 
         return log_probs
 
@@ -308,10 +341,12 @@ class DataParallelPPOActor(BasePPOActor):
             temperature: sampling temperature
             top_k: if > 0, teacher computes its own top-K independently and returns
                 (topk_log_probs [P, resp_len, K], topk_ids [P, resp_len, K]).
+                If < 0, return full-vocab log_probs [P, resp_len, V] (exact KL).
                 If 0, return per-token log_probs [P, resp_len].
 
         Returns:
             (topk_log_probs, topk_ids) when top_k > 0 — both detached
+            all_log_probs [P, resp_len, V] when top_k < 0 — detached
             log_probs [P, resp_len] when top_k == 0 — detached
         """
         resp_len = responses.size(-1)
@@ -357,6 +392,12 @@ class DataParallelPPOActor(BasePPOActor):
             del logits  # free [P, resp_len, V]
             torch.cuda.empty_cache()  # return pool fragments to CUDA before next micro-batch
             return topk_log_probs, topk_ids  # both detached
+        elif top_k < 0:
+            # Full-vocab mode: return log_softmax over entire vocabulary
+            all_log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)  # [P, resp_len, V]
+            del logits
+            torch.cuda.empty_cache()
+            return all_log_probs  # detached, [P, resp_len, V]
         else:
             log_probs = self.log_probs_from_logits(logits, responses)  # [P, resp_len] — detached
             del logits
@@ -375,6 +416,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         Returns DataProto with tensors:
           pid_top_k > 0: "teacher_topk_log_probs" [B, T, K], "teacher_topk_ids" [B, T, K]
+          pid_top_k < 0: "teacher_full_vocab_flag" [B] + meta_info["teacher_all_log_probs_cpu"] [B,T,V] on CPU
           pid_top_k == 0: "teacher_log_probs" [B, T]
         """
         self.actor_module.eval()
@@ -410,6 +452,35 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_topk_log_probs": teacher_lp  * mask,        # [B, T, K]
                 "teacher_topk_ids":       teacher_ids * mask.long(),  # [B, T, K]
             })
+        elif K < 0:
+            # Full-vocab mode: [B, T, V] is too large for GPU — keep on CPU.
+            all_lp = []
+            for micro_batch in micro_batches:
+                mb_b = micro_batch.batch
+                t_lp = self._forward_teacher(
+                    mb_b["hint_input_ids"], mb_b["hint_attention_mask"],
+                    mb_b["hint_position_ids"], mb_b["responses"],
+                    temperature, top_k=K,
+                )  # [mb, T, V] — detached, on GPU
+                all_lp.append(t_lp.cpu())  # move to CPU immediately
+                del t_lp
+                torch.cuda.empty_cache()
+
+            teacher_lp_cpu = torch.cat(all_lp, dim=0)            # [B, T, V] on CPU
+            del all_lp
+            mask_cpu = pid_mask.cpu()[:, None, None].float()     # [B, 1, 1]
+            teacher_lp_cpu = teacher_lp_cpu * mask_cpu           # zero out non-PID
+
+            # Store on instance — avoids Ray object store serialization (~55 GiB).
+            # fsdp_workers will transfer this to the actor instance if ref model is teacher.
+            # update_policy reads from self._teacher_all_log_probs_cpu.
+            self._teacher_all_log_probs_cpu = teacher_lp_cpu
+
+            # Return a small flag tensor for batch-size compatibility in union().
+            B = teacher_lp_cpu.size(0)
+            return DataProto.from_dict(
+                tensors={"teacher_full_vocab_flag": torch.ones(B, dtype=torch.bool)},
+            )
         else:
             all_lp = []
             for micro_batch in micro_batches:
@@ -433,15 +504,18 @@ class DataParallelPPOActor(BasePPOActor):
         pid_mask: torch.Tensor,
         student_log_probs: torch.Tensor,
         student_topk: tuple = None,
+        student_all_log_probs: torch.Tensor = None,
         response_mask: torch.Tensor = None,
+        teacher_all_cpu: torch.Tensor = None,
     ) -> torch.Tensor:
         """Compute PID distillation loss for masked samples.
 
         Teacher outputs are read from pre-computed keys in model_inputs (populated by
         _precompute_teacher_outputs before the training loop — old-policy snapshot).
 
-        Two modes controlled by self.config.pid_top_k:
+        Three modes controlled by self.config.pid_top_k:
         - pid_top_k > 0: Top-K KL on independent top-K sets (reads teacher_topk_log_probs/ids)
+        - pid_top_k < 0: Full-vocab KL over entire vocabulary
         - pid_top_k == 0: Single-token KL using per-token log-probs (reads teacher_log_probs)
 
         Args:
@@ -449,7 +523,11 @@ class DataParallelPPOActor(BasePPOActor):
             pid_mask: [B] bool — True for PID-active samples
             student_log_probs: [B, T] — student log probs (with grad)
             student_topk: (topk_log_probs [B,T,K], topk_probs [B,T,K], topk_ids [B,T,K]) or None
+            student_all_log_probs: [B, T, V] — full-vocab student log probs (with grad), or None
             response_mask: [B, T] — response mask
+            teacher_all_cpu: [full_B, T, V] — full-vocab teacher log probs on CPU, or None.
+                When provided, _batch_idx in model_inputs maps micro-batch indices to the
+                original batch so we can slice the CPU tensor.
 
         Returns:
             pid_loss: scalar tensor
@@ -460,9 +538,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         pid_resp_mask = response_mask[pid_idx]  # [P, T]
 
-        use_topk = self.config.pid_top_k > 0
-
-        if use_topk:
+        if self.config.pid_top_k > 0:
             # Top-K mode: read pre-computed teacher top-K from model_inputs
             s_topk_lp, s_topk_p, s_topk_ids = student_topk
             s_topk_lp  = s_topk_lp[pid_idx]   # [P, T, K] — with grad
@@ -478,6 +554,24 @@ class DataParallelPPOActor(BasePPOActor):
                 student_topk_ids=s_topk_ids,
                 teacher_topk_log_probs=t_topk_lp,
                 teacher_topk_ids=t_topk_ids,
+                kl_direction=self.config.pid_kl_direction,
+            )  # [P, T]
+        elif self.config.pid_top_k < 0:
+            # Full-vocab mode: exact KL over entire vocabulary
+            s_all_lp = student_all_log_probs[pid_idx]  # [P, T, V] — with grad
+
+            if teacher_all_cpu is not None:
+                # CPU path: teacher [full_B, T, V] stays on CPU — compute_full_vocab_kl
+                # transfers chunks to GPU on the fly to avoid full [P, T, V] GPU allocation.
+                global_pid_idx = model_inputs["_batch_idx"][pid_idx].cpu()  # original batch indices
+                t_all_lp = teacher_all_cpu[global_pid_idx]  # [P, T, V] on CPU
+            else:
+                # GPU path (backward compat): teacher is in model_inputs on GPU
+                t_all_lp = model_inputs["teacher_all_log_probs"][pid_idx]  # [P, T, V]
+
+            kl = compute_full_vocab_kl(
+                student_all_log_probs=s_all_lp,
+                teacher_all_log_probs=t_all_lp,
                 kl_direction=self.config.pid_kl_direction,
             )  # [P, T]
         else:
@@ -498,14 +592,34 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
 
+        # Full-vocab teacher log_probs live on CPU as an instance attribute (too large
+        # for GPU or Ray object store).  _batch_idx maps micro-batch indices back to it.
+        teacher_all_cpu = getattr(self, "_teacher_all_log_probs_cpu", None)  # [B, T, V] on CPU or None
+        if teacher_all_cpu is not None:
+            data.batch.unlock_()
+            data.batch["_batch_idx"] = torch.arange(len(data), device=data.batch.device)
+            data.batch.lock_()
+
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
-        select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
-        if self.config.enable_pid:
-            select_keys.extend(["pid_mask", "pid_group_mask"])
+        if self.config.enable_opsd:
+            # OPSD: pure distillation, no pg_loss → no old_log_probs/ref_log_probs/advantages
+            select_keys.extend(["pid_mask"])
             if "teacher_topk_log_probs" in data.batch.keys():
                 select_keys.extend(["teacher_topk_log_probs", "teacher_topk_ids"])
+            if teacher_all_cpu is not None:
+                select_keys.append("_batch_idx")
             if "teacher_log_probs" in data.batch.keys():
                 select_keys.extend(["teacher_log_probs"])
+        else:
+            select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
+            if self.config.enable_pid:
+                select_keys.extend(["pid_mask", "pid_group_mask"])
+                if "teacher_topk_log_probs" in data.batch.keys():
+                    select_keys.extend(["teacher_topk_log_probs", "teacher_topk_ids"])
+                if teacher_all_cpu is not None:
+                    select_keys.append("_batch_idx")
+                if "teacher_log_probs" in data.batch.keys():
+                    select_keys.extend(["teacher_log_probs"])
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -535,95 +649,143 @@ class DataParallelPPOActor(BasePPOActor):
                     torch.cuda.empty_cache()  # defragment pool from previous micro-batch's variable-length fwd/bwd
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_probs = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
 
-                    # Determine if we need compact top-K (only for PID top-k mode with active PID)
-                    need_topk = (
-                        self.config.enable_pid
-                        and self.config.pid_top_k > 0
-                        and "pid_mask" in model_inputs
-                        and model_inputs["pid_mask"].any()
-                    )
+                    if self.config.enable_opsd:
+                        # ── OPSD: pure distillation, no policy gradient ──
+                        has_active_pid = "pid_mask" in model_inputs and model_inputs["pid_mask"].any()
+                        need_topk = self.config.pid_top_k > 0 and has_active_pid
+                        need_full_vocab = self.config.pid_top_k < 0 and has_active_pid
 
-                    if need_topk:
-                        log_probs, topk_log_probs, topk_probs, topk_ids = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, pid_top_k=self.config.pid_top_k
-                        )  # [B, T], [B, T, K], [B, T, K], [B, T, K]
-                        student_topk = (topk_log_probs, topk_probs, topk_ids)
-                    else:
-                        log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
                         student_topk = None
+                        student_all_log_probs = None
+                        if need_topk:
+                            log_probs, topk_log_probs, topk_probs, topk_ids = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, pid_top_k=self.config.pid_top_k
+                            )
+                            student_topk = (topk_log_probs, topk_probs, topk_ids)
+                        elif need_full_vocab:
+                            log_probs, student_all_log_probs = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, pid_top_k=self.config.pid_top_k
+                            )
+                        else:
+                            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
 
-                    pg_loss, pg_metrics = compute_policy_loss(
-                        old_log_probs=old_log_probs,
-                        log_probs=log_probs,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        clip_ratio_low=self.config.clip_ratio_low,
-                        clip_ratio_high=self.config.clip_ratio_high,
-                        clip_ratio_dual=self.config.clip_ratio_dual,
-                        tau_positive=self.config.tau_positive,
-                        tau_negative=self.config.tau_negative,
-                        loss_type=self.config.loss_type,
-                        loss_avg_mode=self.config.loss_avg_mode,
-                    )
+                        if has_active_pid:
+                            pid_loss = self._compute_pid_loss(
+                                model_inputs, model_inputs["pid_mask"],
+                                log_probs, student_topk, student_all_log_probs, response_mask,
+                                teacher_all_cpu=teacher_all_cpu,
+                            )
+                            loss = pid_loss * self.config.opsd_coef
+                            append_to_dict(metrics, {"actor/opsd_kl": pid_loss.detach().item()})
+                            append_to_dict(metrics, {"actor/opsd_loss": loss.detach().item()})
+                        else:
+                            # No valid samples for distillation → zero loss
+                            loss = torch.tensor(0.0, device=log_probs.device, requires_grad=True)
+                            append_to_dict(metrics, {"actor/opsd_kl": 0.0})
+                            append_to_dict(metrics, {"actor/opsd_loss": 0.0})
 
-                    # Standard KL loss (now with kl_direction support)
-                    if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
-                        ref_log_probs = model_inputs["ref_log_probs"]
-                        kld = compute_kl(
-                            log_probs=log_probs,
-                            ref_log_probs=ref_log_probs,
-                            kl_penalty=self.config.kl_penalty,
-                            kl_direction=self.config.kl_direction,
-                        )
+                        loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                        loss.backward()
 
-                        # Zero KL for PID groups (PID replaces ref KL entirely)
-                        if self.config.enable_pid and "pid_group_mask" in model_inputs:
-                            kld = kld * (~model_inputs["pid_group_mask"]).unsqueeze(-1).float()
-
-                        kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
-                        loss = pg_loss + kl_loss * self.config.kl_coef
-                        append_to_dict(metrics, {"actor/kl_loss": kl_loss.detach().item()})
-                        append_to_dict(metrics, {"actor/kl_coef": self.config.kl_coef})
                     else:
-                        loss = pg_loss
+                        # ── Standard PID-GRPO / GRPO path ──
+                        old_log_probs = model_inputs["old_log_probs"]
+                        advantages = model_inputs["advantages"]
 
-                    # PID loss (for PID-active samples)
-                    if (
-                        self.config.enable_pid
-                        and "pid_mask" in model_inputs
-                        and model_inputs["pid_mask"].any()
-                    ):
-                        pid_loss = self._compute_pid_loss(
-                            model_inputs, model_inputs["pid_mask"],
-                            log_probs, student_topk, response_mask,
+                        # Determine if we need extended student outputs for PID
+                        pid_active = (
+                            self.config.enable_pid
+                            and "pid_mask" in model_inputs
+                            and model_inputs["pid_mask"].any()
                         )
-                        loss = loss + pid_loss * self.config.pid_coef
-                        append_to_dict(metrics, {"actor/pid_kl": pid_loss.detach().item()})
-                        append_to_dict(metrics, {"actor/pid_loss": (pid_loss * self.config.pid_coef).detach().item()})
-                        append_to_dict(metrics, {"actor/pid_ratio": model_inputs["pid_mask"].float().mean().item()})
+                        need_topk = pid_active and self.config.pid_top_k > 0
+                        need_full_vocab = pid_active and self.config.pid_top_k < 0
 
-                        # Ori-entropy loss: -E[log π(a|s)] on PID-active samples
-                        # ≈ H(π_actor) — encourages actor not to collapse toward teacher
-                        if self.config.use_ori_entropy_loss:
-                            pid_idx = model_inputs["pid_mask"].nonzero(as_tuple=True)[0]
-                            ori_entropy_loss = -VF.masked_mean(
-                                log_probs[pid_idx], response_mask[pid_idx]
-                            )  # scalar
-                            loss = loss + self.config.ori_entropy_loss_coef * ori_entropy_loss
-                            append_to_dict(metrics, {"actor/ori_entropy_loss": ori_entropy_loss.detach().item()})
-                            append_to_dict(metrics, {"actor/ori_entropy_loss_coef": self.config.ori_entropy_loss_coef})
+                        student_topk = None
+                        student_all_log_probs = None
+                        if need_topk:
+                            log_probs, topk_log_probs, topk_probs, topk_ids = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, pid_top_k=self.config.pid_top_k
+                            )  # [B, T], [B, T, K], [B, T, K], [B, T, K]
+                            student_topk = (topk_log_probs, topk_probs, topk_ids)
+                        elif need_full_vocab:
+                            log_probs, student_all_log_probs = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, pid_top_k=self.config.pid_top_k
+                            )  # [B, T], [B, T, V]
+                        else:
+                            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                            student_topk = None
 
-                    loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
-                    loss.backward()
+                        pg_loss, pg_metrics = compute_policy_loss(
+                            old_log_probs=old_log_probs,
+                            log_probs=log_probs,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            clip_ratio_low=self.config.clip_ratio_low,
+                            clip_ratio_high=self.config.clip_ratio_high,
+                            clip_ratio_dual=self.config.clip_ratio_dual,
+                            tau_positive=self.config.tau_positive,
+                            tau_negative=self.config.tau_negative,
+                            loss_type=self.config.loss_type,
+                            loss_avg_mode=self.config.loss_avg_mode,
+                        )
 
-                    batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
-                    batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
-                    append_to_dict(metrics, batch_metrics)
+                        # Standard KL loss (now with kl_direction support)
+                        if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
+                            ref_log_probs = model_inputs["ref_log_probs"]
+                            kld = compute_kl(
+                                log_probs=log_probs,
+                                ref_log_probs=ref_log_probs,
+                                kl_penalty=self.config.kl_penalty,
+                                kl_direction=self.config.kl_direction,
+                            )
+
+                            # Zero KL for PID groups (PID replaces ref KL entirely)
+                            if self.config.enable_pid and "pid_group_mask" in model_inputs:
+                                kld = kld * (~model_inputs["pid_group_mask"]).unsqueeze(-1).float()
+
+                            kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
+                            loss = pg_loss + kl_loss * self.config.kl_coef
+                            append_to_dict(metrics, {"actor/kl_loss": kl_loss.detach().item()})
+                            append_to_dict(metrics, {"actor/kl_coef": self.config.kl_coef})
+                        else:
+                            loss = pg_loss
+
+                        # PID loss (for PID-active samples)
+                        if pid_active:
+                            pid_loss = self._compute_pid_loss(
+                                model_inputs, model_inputs["pid_mask"],
+                                log_probs, student_topk, student_all_log_probs, response_mask,
+                            )
+                            loss = loss + pid_loss * self.config.pid_coef
+                            append_to_dict(metrics, {"actor/pid_kl": pid_loss.detach().item()})
+                            append_to_dict(metrics, {"actor/pid_loss": (pid_loss * self.config.pid_coef).detach().item()})
+                            append_to_dict(metrics, {"actor/pid_ratio": model_inputs["pid_mask"].float().mean().item()})
+
+                            # Ori-entropy loss: -E[log π(a|s)] on PID-active samples
+                            # ≈ H(π_actor) — encourages actor not to collapse toward teacher
+                            if self.config.use_ori_entropy_loss:
+                                pid_idx = model_inputs["pid_mask"].nonzero(as_tuple=True)[0]
+                                ori_entropy_loss = -VF.masked_mean(
+                                    log_probs[pid_idx], response_mask[pid_idx]
+                                )  # scalar
+                                loss = loss + self.config.ori_entropy_loss_coef * ori_entropy_loss
+                                append_to_dict(metrics, {"actor/ori_entropy_loss": ori_entropy_loss.detach().item()})
+                                append_to_dict(metrics, {"actor/ori_entropy_loss_coef": self.config.ori_entropy_loss_coef})
+
+                        loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                        loss.backward()
+
+                        batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
+                        batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
+                        append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
+        # Free full-vocab teacher tensor after training is done
+        if hasattr(self, "_teacher_all_log_probs_cpu"):
+            del self._teacher_all_log_probs_cpu
 
         return metrics

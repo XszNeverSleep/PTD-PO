@@ -114,6 +114,7 @@ class RLHFDataset(Dataset):
         filter_overlong_prompts_workers: int = 16,
         prompt_with_hint_key: Optional[str] = None,
         max_hint_prompt_length: Optional[int] = None,
+        hint_format_prompt: Optional[str] = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -150,6 +151,11 @@ class RLHFDataset(Dataset):
         if format_prompt:
             with open(format_prompt, encoding="utf-8") as f:
                 self.format_prompt = f.read()
+
+        self.hint_format_prompt = None
+        if hint_format_prompt:
+            with open(hint_format_prompt, encoding="utf-8") as f:
+                self.hint_format_prompt = f.read()
 
         if filter_overlong_prompts:
             self.dataset = self.dataset.filter(
@@ -191,9 +197,9 @@ class RLHFDataset(Dataset):
     def _build_hint_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         """Build chat messages from hint prompt. Uses same image/video placeholder handling as _build_messages."""
         hint_str: str = example[self.prompt_with_hint_key]
-        if self.format_prompt:
-            format_prompt = Template(self.format_prompt.strip())
-            hint_str = format_prompt.render(content=hint_str)
+        fmt = self.hint_format_prompt or self.format_prompt
+        if fmt:
+            hint_str = Template(fmt.strip()).render(content=hint_str)
 
         if self.image_key in example:
             content_list = []

@@ -59,10 +59,13 @@ class DataConfig:
     """Key for hint-augmented prompt column. Set to enable PID data loading."""
     max_hint_prompt_length: Optional[int] = None
     """Max length for hint prompts (defaults to max_prompt_length if None)."""
+    hint_format_prompt: Optional[str] = None
+    """Jinja template file for hint prompts. Falls back to format_prompt if None."""
 
     def post_init(self):
         self.image_dir = get_abs_path(self.image_dir, prompt="Image directory")
         self.format_prompt = get_abs_path(self.format_prompt, prompt="Format prompt file")
+        self.hint_format_prompt = get_abs_path(self.hint_format_prompt, prompt="Hint format prompt file")
         self.override_chat_template = get_abs_path(self.override_chat_template, prompt="Chat template file")
 
 
@@ -112,10 +115,16 @@ class AlgorithmConfig:
     """KL direction for PID distillation: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
     pid_all_trajectories: bool = False
     """When True, apply PID distillation to ALL trajectories in PID groups (including correct ones). Default: only incorrect."""
+    pid_use_ref_teacher: bool = False
+    """If True, PID teacher uses frozen ref model instead of old policy (which updates every step)."""
     use_ori_entropy_loss: bool = False
     """Add original-policy entropy bonus on PID-active samples: -E[log π(a|s)]."""
     ori_entropy_loss_coef: float = 0.0
     """Coefficient for ori_entropy_loss."""
+    enable_opsd: bool = False
+    """OPSD mode: pure on-policy self-distillation. Teacher=frozen ref model, no policy gradient."""
+    opsd_coef: float = 1.0
+    """Coefficient for OPSD distillation loss."""
 
 
 @dataclass
@@ -192,6 +201,8 @@ class PPOConfig:
         self.worker.actor.pid_kl_direction = self.algorithm.pid_kl_direction
         self.worker.actor.use_ori_entropy_loss = self.algorithm.use_ori_entropy_loss
         self.worker.actor.ori_entropy_loss_coef = self.algorithm.ori_entropy_loss_coef
+        self.worker.actor.enable_opsd = self.algorithm.enable_opsd
+        self.worker.actor.opsd_coef = self.algorithm.opsd_coef
 
     def deep_post_init(self):
         recursive_post_init(self)

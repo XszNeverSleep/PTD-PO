@@ -554,6 +554,10 @@ class FSDPWorker(Worker):
         self._process_multi_modal_inputs(data)
         data = data.to(torch.cuda.current_device())
 
+        # Ensure temperature is always available (OPSD skips compute_log_probs which
+        # normally sets this, so it may be missing from meta_info).
+        data.meta_info.setdefault("temperature", self.config.rollout.temperature)
+
         if self._use_param_offload:
             load_fsdp_model(self.fsdp_module)
 
@@ -688,6 +692,41 @@ class FSDPWorker(Worker):
 
         if self._use_param_offload:
             offload_fsdp_model(self.fsdp_module)
+
+        output = output.to("cpu")
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_ref_teacher_log_probs(self, data: DataProto):
+        """OPSD: use frozen ref model as teacher for hint+response forward."""
+        assert self._has_ref
+
+        adapter_ctx = self.ref_fsdp_module.disable_adapter() if self._is_lora else nullcontext()
+
+        self._process_multi_modal_inputs(data)
+        data = data.to(torch.cuda.current_device())
+
+        if self._use_ref_param_offload or (self._is_lora and self._use_param_offload):
+            load_fsdp_model(self.ref_fsdp_module)
+
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        with self.ulysses_sharding_manager, adapter_ctx:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            output = self.ref_policy.compute_teacher_log_prob(data=data)
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        if self.world_size > 1:
+            self.ref_fsdp_module._handle.reshard(True)
+
+        if self._use_ref_param_offload or (self._is_lora and self._use_param_offload):
+            offload_fsdp_model(self.ref_fsdp_module)
+
+        # For full-vocab KL (pid_top_k < 0): the [B,T,V] CPU tensor is stored on
+        # self.ref_policy.  Transfer it to self.actor so update_policy can read it
+        # without going through Ray's object store.
+        if hasattr(self.ref_policy, "_teacher_all_log_probs_cpu"):
+            self.actor._teacher_all_log_probs_cpu = self.ref_policy._teacher_all_log_probs_cpu
+            del self.ref_policy._teacher_all_log_probs_cpu
 
         output = output.to("cpu")
         return output
