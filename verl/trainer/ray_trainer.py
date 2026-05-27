@@ -575,6 +575,14 @@ class RayPPOTrainer:
         main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
         val_metrics: Optional[dict[str, Any]] = None
 
+        # Open file for group reward statistics (empirical observation)
+        if self.config.trainer.save_group_stats:
+            group_stats_path = os.path.join(
+                self.config.trainer.save_checkpoint_path or ".",
+                "group_reward_stats.jsonl"
+            )
+            self._group_stats_file = open(group_stats_path, "a")
+
         # load checkpoint before doing anything
         self._load_checkpoint()
         main_tqdm.update(self.global_step)
@@ -709,6 +717,41 @@ class RayPPOTrainer:
                         metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
                         metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
 
+                    # --- Group reward statistics for empirical observation ---
+                    if (self.config.trainer.save_group_stats
+                            and accuracy_list is not None
+                            and "uid" in batch.non_tensor_batch):
+                        uids = batch.non_tensor_batch["uid"]
+                        uid2acc = defaultdict(list)
+                        for i in range(len(uids)):
+                            uid2acc[uids[i]].append(float(accuracy_list[i]))
+
+                        G = self.config.worker.rollout.n
+                        group_success_counts = [
+                            sum(1 for a in accs if a == 1.0) for accs in uid2acc.values()
+                        ]
+                        total_groups = len(group_success_counts)
+
+                        all_fail = sum(1 for m in group_success_counts if m == 0)
+                        all_pass = sum(1 for m in group_success_counts if m == G)
+                        informative = total_groups - all_fail - all_pass
+
+                        metrics["group_reward/all_fail_ratio"] = all_fail / total_groups
+                        metrics["group_reward/all_pass_ratio"] = all_pass / total_groups
+                        metrics["group_reward/informative_ratio"] = informative / total_groups
+                        metrics["group_reward/total_groups"] = total_groups
+
+                        for m_val in range(G + 1):
+                            cnt = sum(1 for c in group_success_counts if c == m_val)
+                            metrics[f"group_reward/m_{m_val}_ratio"] = cnt / total_groups
+
+                        self._group_stats_file.write(json.dumps({
+                            "step": self.global_step,
+                            "group_success_counts": group_success_counts,
+                            "G": G,
+                        }) + "\n")
+                        self._group_stats_file.flush()
+
                     # OPSD mode: ALL samples get distillation, teacher = frozen ref model
                     if self.config.algorithm.enable_opsd and "hint_input_ids" in batch.batch:
                         has_hint = batch.batch["hint_attention_mask"].sum(dim=-1) > 0  # [B] bool
@@ -823,3 +866,7 @@ class RayPPOTrainer:
 
         if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
             self._save_checkpoint()
+
+        # Close group reward stats file
+        if hasattr(self, '_group_stats_file'):
+            self._group_stats_file.close()

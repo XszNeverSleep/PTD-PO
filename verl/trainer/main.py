@@ -112,6 +112,13 @@ def main():
                 "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
             }
         }
+        # Propagate swanlab env vars to Ray workers so offline mode works in multi-node
+        import os
+
+        for key in ("SWANLAB_MODE", "SWANLAB_DIR", "SWANLAB_API_KEY"):
+            val = os.environ.get(key)
+            if val is not None:
+                runtime_env["env_vars"][key] = val
         ray.init(runtime_env=runtime_env)
 
     runner = Runner.remote()

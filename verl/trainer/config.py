@@ -169,6 +169,8 @@ class TrainerConfig:
     """file to save ray timeline"""
     find_last_checkpoint: bool = True
     """automatically find the last checkpoint in the save checkpoint path to resume training"""
+    save_group_stats: bool = False
+    """save per-step group reward statistics to group_reward_stats.jsonl for empirical observation"""
 
     def post_init(self):
         if self.save_checkpoint_path is None:
