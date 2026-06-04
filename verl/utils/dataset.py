@@ -348,7 +348,7 @@ class RLHFDataset(Dataset):
         example["raw_prompt_ids"] = raw_prompt_ids
         example["ground_truth"] = example.pop(self.answer_key)
 
-        # Tokenize hint prompt for PID mode (skip if key absent or hint string is empty)
+        # Tokenize hint prompt for PTD mode (skip if key absent or hint string is empty)
         if self.prompt_with_hint_key and self.prompt_with_hint_key in example:
             hint_str = example.get(self.prompt_with_hint_key, "")
             if hint_str and hint_str.strip():

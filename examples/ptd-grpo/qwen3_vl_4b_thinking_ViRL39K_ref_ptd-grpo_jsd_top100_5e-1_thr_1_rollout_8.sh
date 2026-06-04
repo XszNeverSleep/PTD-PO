@@ -1,12 +1,12 @@
 #!/bin/bash
-# Multi-node variant (invoke via: bash examples/pid-grpo/launch_multinode.sh examples/pid-grpo/qwen3_vl_4b_thinking_ViRL39K_ref_pid-grpo_jsd_top100_5e-1_thr_1_rollout_8.sh)
+# Multi-node variant (invoke via: bash examples/ptd-grpo/launch_multinode.sh examples/ptd-grpo/qwen3_vl_4b_thinking_ViRL39K_ref_ptd-grpo_jsd_top100_5e-1_thr_1_rollout_8.sh)
 
 set -x
 
 N_GPU="${RESOURCE_GPU:-8}"
 NNODES="${WORLD_SIZE:-2}"
 
-EXP_NAME=qwen3_vl_4b_thinking_ViRL39K_ref_pid-grpo_jsd_top100_5e-1_thr_1_rollout_8_max_token_4096
+EXP_NAME=qwen3_vl_4b_thinking_ViRL39K_ref_ptd-grpo_jsd_top100_5e-1_thr_1_rollout_8_max_token_4096
 SAVE_PATH=your/save/path/${EXP_NAME}
 PROJECT_NAME=""
 
@@ -66,9 +66,9 @@ python3 -m verl.trainer.main \
     algorithm.kl_penalty=low_var_kl \
     algorithm.kl_coef=1.0e-2 \
     algorithm.kl_direction=forward_kl \
-    algorithm.enable_pid=true \
-    algorithm.pid_threshold=1.0 \
-    algorithm.pid_top_k=100 \
-    algorithm.pid_coef=5.0e-1 \
-    algorithm.pid_kl_direction=jsd_kl \
-    algorithm.pid_use_ref_teacher=true
+    algorithm.enable_ptd=true \
+    algorithm.ptd_threshold=1.0 \
+    algorithm.ptd_top_k=100 \
+    algorithm.ptd_coef=5.0e-1 \
+    algorithm.ptd_kl_direction=jsd_kl \
+    algorithm.ptd_use_ref_teacher=true

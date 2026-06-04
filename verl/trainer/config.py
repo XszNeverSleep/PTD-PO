@@ -56,7 +56,7 @@ class DataConfig:
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
     prompt_with_hint_key: Optional[str] = None
-    """Key for hint-augmented prompt column. Set to enable PID data loading."""
+    """Key for hint-augmented prompt column. Set to enable PTD data loading."""
     max_hint_prompt_length: Optional[int] = None
     """Max length for hint prompts (defaults to max_prompt_length if None)."""
     hint_format_prompt: Optional[str] = None
@@ -101,24 +101,24 @@ class AlgorithmConfig:
     """filter out high reward samples if online filtering"""
     kl_direction: str = "reverse_kl"
     """KL direction for standard ref KL: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
-    enable_pid: bool = False
-    """Enable PID mode: online policy distillation from hint-augmented teacher."""
-    pid_threshold: float = 1.0
-    """Group accuracy threshold. PID activates for groups with accuracy < threshold."""
-    pid_coef: float = 1.0
-    """Coefficient for PID distillation loss."""
-    pid_top_k: int = 64
+    enable_ptd: bool = False
+    """Enable PTD mode: online policy distillation from hint-augmented teacher."""
+    ptd_threshold: float = 1.0
+    """Group accuracy threshold. PTD activates for groups with accuracy < threshold."""
+    ptd_coef: float = 1.0
+    """Coefficient for PTD distillation loss."""
+    ptd_top_k: int = 64
     """Top-K tokens for Top-K with Tail KL. 0 = single-token KL mode."""
-    pid_kl_penalty: str = "low_var_kl"
-    """KL estimator for PID scalar mode (pid_top_k=0): 'kl', 'abs', 'mse', 'low_var_kl', 'full'."""
-    pid_kl_direction: str = "forward_kl"
-    """KL direction for PID distillation: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
-    pid_all_trajectories: bool = False
-    """When True, apply PID distillation to ALL trajectories in PID groups (including correct ones). Default: only incorrect."""
-    pid_use_ref_teacher: bool = False
-    """If True, PID teacher uses frozen ref model instead of old policy (which updates every step)."""
+    ptd_kl_penalty: str = "low_var_kl"
+    """KL estimator for PTD scalar mode (ptd_top_k=0): 'kl', 'abs', 'mse', 'low_var_kl', 'full'."""
+    ptd_kl_direction: str = "forward_kl"
+    """KL direction for PTD distillation: 'forward_kl', 'reverse_kl', 'jsd_kl'."""
+    ptd_all_trajectories: bool = False
+    """When True, apply PTD distillation to ALL trajectories in PTD groups (including correct ones). Default: only incorrect."""
+    ptd_use_ref_teacher: bool = False
+    """If True, PTD teacher uses frozen ref model instead of old policy (which updates every step)."""
     use_ori_entropy_loss: bool = False
-    """Add original-policy entropy bonus on PID-active samples: -E[log π(a|s)]."""
+    """Add original-policy entropy bonus on PTD-active samples: -E[log π(a|s)]."""
     ori_entropy_loss_coef: float = 0.0
     """Coefficient for ori_entropy_loss."""
     enable_opsd: bool = False
@@ -196,11 +196,11 @@ class PPOConfig:
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
         self.worker.actor.kl_direction = self.algorithm.kl_direction
-        self.worker.actor.enable_pid = self.algorithm.enable_pid
-        self.worker.actor.pid_coef = self.algorithm.pid_coef
-        self.worker.actor.pid_top_k = self.algorithm.pid_top_k
-        self.worker.actor.pid_kl_penalty = self.algorithm.pid_kl_penalty
-        self.worker.actor.pid_kl_direction = self.algorithm.pid_kl_direction
+        self.worker.actor.enable_ptd = self.algorithm.enable_ptd
+        self.worker.actor.ptd_coef = self.algorithm.ptd_coef
+        self.worker.actor.ptd_top_k = self.algorithm.ptd_top_k
+        self.worker.actor.ptd_kl_penalty = self.algorithm.ptd_kl_penalty
+        self.worker.actor.ptd_kl_direction = self.algorithm.ptd_kl_direction
         self.worker.actor.use_ori_entropy_loss = self.algorithm.use_ori_entropy_loss
         self.worker.actor.ori_entropy_loss_coef = self.algorithm.ori_entropy_loss_coef
         self.worker.actor.enable_opsd = self.algorithm.enable_opsd

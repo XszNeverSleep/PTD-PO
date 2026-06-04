@@ -785,34 +785,34 @@ def compute_full_vocab_kl(
     return torch.cat(kl_chunks, dim=1)  # [B, T]
 
 
-def compute_pid_mask(
+def compute_ptd_mask(
     accuracy_scores: torch.Tensor,
     group_index: np.ndarray,
-    pid_threshold: float,
-    pid_all_trajectories: bool = False,
+    ptd_threshold: float,
+    ptd_all_trajectories: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Determine which samples get PID distillation.
+    """Determine which samples get PTD distillation.
 
-    PID activates for groups where group accuracy < pid_threshold.
-    Within such groups, only incorrect trajectories receive PID loss by default,
+    PTD activates for groups where group accuracy < ptd_threshold.
+    Within such groups, only incorrect trajectories receive PTD loss by default,
     but ALL samples in these groups skip standard ref KL.
 
-    When pid_all_trajectories=True, ALL trajectories in PID groups (including
-    correct ones) receive PID distillation loss.
+    When ptd_all_trajectories=True, ALL trajectories in PTD groups (including
+    correct ones) receive PTD distillation loss.
 
     Args:
         accuracy_scores: [B] per-sample accuracy (0.0 or 1.0)
         group_index: [B] group uid (np.ndarray of object)
-        pid_threshold: float — group accuracy threshold
-        pid_all_trajectories: bool — if True, PID loss applies to all trajectories in PID groups
+        ptd_threshold: float — group accuracy threshold
+        ptd_all_trajectories: bool — if True, PTD loss applies to all trajectories in PTD groups
 
     Returns:
-        pid_mask: [B] bool. True = receives PID loss
-        pid_group_mask: [B] bool. True = in PID group (skips ref KL, both correct and incorrect)
+        ptd_mask: [B] bool. True = receives PTD loss
+        ptd_group_mask: [B] bool. True = in PTD group (skips ref KL, both correct and incorrect)
     """
     bsz = accuracy_scores.shape[0]
-    pid_mask = torch.zeros(bsz, dtype=torch.bool)
-    pid_group_mask = torch.zeros(bsz, dtype=torch.bool)
+    ptd_mask = torch.zeros(bsz, dtype=torch.bool)
+    ptd_group_mask = torch.zeros(bsz, dtype=torch.bool)
 
     id2indices = defaultdict(list)
     id2acc = defaultdict(list)
@@ -822,10 +822,10 @@ def compute_pid_mask(
 
     for uid in id2indices:
         group_accuracy = sum(1 for a in id2acc[uid] if a == 1.0) / len(id2acc[uid])
-        if group_accuracy < pid_threshold:
+        if group_accuracy < ptd_threshold:
             for idx, acc in zip(id2indices[uid], id2acc[uid]):
-                pid_group_mask[idx] = True
-                if pid_all_trajectories or acc != 1.0:
-                    pid_mask[idx] = True
+                ptd_group_mask[idx] = True
+                if ptd_all_trajectories or acc != 1.0:
+                    ptd_mask[idx] = True
 
-    return pid_mask, pid_group_mask
+    return ptd_mask, ptd_group_mask

@@ -671,7 +671,7 @@ class FSDPWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_teacher_log_probs(self, data: DataProto):
-        """Compute PID teacher log_probs/top-K for PID-active samples using old-policy weights."""
+        """Compute PTD teacher log_probs/top-K for PTD-active samples using old-policy weights."""
         assert self._has_actor
 
         self._process_multi_modal_inputs(data)
@@ -721,7 +721,7 @@ class FSDPWorker(Worker):
         if self._use_ref_param_offload or (self._is_lora and self._use_param_offload):
             offload_fsdp_model(self.ref_fsdp_module)
 
-        # For full-vocab KL (pid_top_k < 0): the [B,T,V] CPU tensor is stored on
+        # For full-vocab KL (ptd_top_k < 0): the [B,T,V] CPU tensor is stored on
         # self.ref_policy.  Transfer it to self.actor so update_policy can read it
         # without going through Ray's object store.
         if hasattr(self.ref_policy, "_teacher_all_log_probs_cpu"):

@@ -50,7 +50,7 @@ from .core_algos import (
     KLController,
     compute_advantage_return,
     compute_kl,
-    compute_pid_mask,
+    compute_ptd_mask,
     get_kl_controller,
 )
 from .metrics import (
@@ -648,7 +648,7 @@ class RayPPOTrainer:
                     else:
                         reward_metrics_raw = None
 
-                    # Collect accuracy list for PID mask / monitoring
+                    # Collect accuracy list for PTD mask / monitoring
                     if reward_metrics_raw is not None:
                         accuracy_list = reward_metrics_raw.get("accuracy", None)
                     elif "_raw_reward_metrics" in metrics:
@@ -656,42 +656,42 @@ class RayPPOTrainer:
                     else:
                         accuracy_list = None
 
-                    # Compute PID mask if PID is enabled and hint data is available
-                    if self.config.algorithm.enable_pid and "hint_input_ids" in batch.batch:
+                    # Compute PTD mask if PTD is enabled and hint data is available
+                    if self.config.algorithm.enable_ptd and "hint_input_ids" in batch.batch:
                         if accuracy_list is None:
-                            print("Warning: PID requires 'accuracy' in reward scores. Skipping PID for this step.")
+                            print("Warning: PTD requires 'accuracy' in reward scores. Skipping PTD for this step.")
                         else:
                             accuracy_scores = torch.tensor(accuracy_list, dtype=torch.float32)
 
                             # Build a "has_hint" mask: samples whose hint_attention_mask is all-zeros have no hint
                             has_hint = batch.batch["hint_attention_mask"].sum(dim=-1) > 0  # [B] bool
 
-                            pid_mask, pid_group_mask = compute_pid_mask(
+                            ptd_mask, ptd_group_mask = compute_ptd_mask(
                                 accuracy_scores, batch.non_tensor_batch["uid"],
-                                self.config.algorithm.pid_threshold,
-                                pid_all_trajectories=self.config.algorithm.pid_all_trajectories,
+                                self.config.algorithm.ptd_threshold,
+                                ptd_all_trajectories=self.config.algorithm.ptd_all_trajectories,
                             )
-                            pid_mask = pid_mask & has_hint  # Exclude samples without valid hint data
-                            pid_group_mask = pid_group_mask & has_hint
+                            ptd_mask = ptd_mask & has_hint  # Exclude samples without valid hint data
+                            ptd_group_mask = ptd_group_mask & has_hint
 
-                            batch.batch["pid_mask"] = pid_mask
-                            batch.batch["pid_group_mask"] = pid_group_mask
+                            batch.batch["ptd_mask"] = ptd_mask
+                            batch.batch["ptd_group_mask"] = ptd_group_mask
                             uids = batch.non_tensor_batch["uid"]
-                            pid_groups = len(set(uids[i] for i in range(len(uids)) if pid_group_mask[i]))
+                            ptd_groups = len(set(uids[i] for i in range(len(uids)) if ptd_group_mask[i]))
                             total_groups = len(set(uids))
-                            metrics["pid/pid_groups"] = pid_groups
-                            metrics["pid/total_groups"] = total_groups
-                            metrics["pid/pid_trajectories"] = pid_mask.sum().item()
-                            metrics["pid/pid_group_trajectories"] = pid_mask.sum().item()
-                            metrics["pid/total_trajectories"] = pid_mask.numel()
-                            metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
-                            metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
+                            metrics["ptd/ptd_groups"] = ptd_groups
+                            metrics["ptd/total_groups"] = total_groups
+                            metrics["ptd/ptd_trajectories"] = ptd_mask.sum().item()
+                            metrics["ptd/ptd_group_trajectories"] = ptd_mask.sum().item()
+                            metrics["ptd/total_trajectories"] = ptd_mask.numel()
+                            metrics["ptd/mask_ratio"] = ptd_mask.float().mean().item()
+                            metrics["ptd/group_mask_ratio"] = ptd_group_mask.float().mean().item()
 
                             # Compute teacher outputs — once, before update_actor.
                             # Results are union-ed into batch so update_policy can split them per mini-batch.
-                            if pid_mask.any():
+                            if ptd_mask.any():
                                 with timer("teacher", timing_raw):
-                                    if self.config.algorithm.pid_use_ref_teacher and self.use_reference_policy:
+                                    if self.config.algorithm.ptd_use_ref_teacher and self.use_reference_policy:
                                         teacher_output = self.actor_rollout_ref_wg.compute_ref_teacher_log_probs(batch)
                                     else:
                                         teacher_output = self.actor_rollout_ref_wg.compute_teacher_log_probs(batch)
@@ -699,23 +699,23 @@ class RayPPOTrainer:
 
                     elif accuracy_list is not None and "uid" in batch.non_tensor_batch \
                             and len(accuracy_list) == len(batch.non_tensor_batch["uid"]):
-                        # Monitor-only: log PID-style group statistics without activating PID
+                        # Monitor-only: log PTD-style group statistics without activating PTD
                         accuracy_scores = torch.tensor(accuracy_list, dtype=torch.float32)
-                        pid_mask, pid_group_mask = compute_pid_mask(
+                        ptd_mask, ptd_group_mask = compute_ptd_mask(
                             accuracy_scores, batch.non_tensor_batch["uid"],
-                            self.config.algorithm.pid_threshold,
-                            pid_all_trajectories=self.config.algorithm.pid_all_trajectories,
+                            self.config.algorithm.ptd_threshold,
+                            ptd_all_trajectories=self.config.algorithm.ptd_all_trajectories,
                         )
                         uids = batch.non_tensor_batch["uid"]
-                        pid_groups = len(set(uids[i] for i in range(len(uids)) if pid_group_mask[i]))
+                        ptd_groups = len(set(uids[i] for i in range(len(uids)) if ptd_group_mask[i]))
                         total_groups = len(set(uids))
-                        metrics["pid/pid_groups"] = pid_groups
-                        metrics["pid/total_groups"] = total_groups
-                        metrics["pid/pid_trajectories"] = pid_mask.sum().item()
-                        metrics["pid/pid_group_trajectories"] = pid_group_mask.sum().item()
-                        metrics["pid/total_trajectories"] = pid_mask.numel()
-                        metrics["pid/mask_ratio"] = pid_mask.float().mean().item()
-                        metrics["pid/group_mask_ratio"] = pid_group_mask.float().mean().item()
+                        metrics["ptd/ptd_groups"] = ptd_groups
+                        metrics["ptd/total_groups"] = total_groups
+                        metrics["ptd/ptd_trajectories"] = ptd_mask.sum().item()
+                        metrics["ptd/ptd_group_trajectories"] = ptd_group_mask.sum().item()
+                        metrics["ptd/total_trajectories"] = ptd_mask.numel()
+                        metrics["ptd/mask_ratio"] = ptd_mask.float().mean().item()
+                        metrics["ptd/group_mask_ratio"] = ptd_group_mask.float().mean().item()
 
                     # --- Group reward statistics for empirical observation ---
                     if (self.config.trainer.save_group_stats
@@ -757,16 +757,16 @@ class RayPPOTrainer:
                         has_hint = batch.batch["hint_attention_mask"].sum(dim=-1) > 0  # [B] bool
 
                         # OPSD: all samples with valid hints get distillation
-                        pid_mask = has_hint
-                        pid_group_mask = has_hint
-                        batch.batch["pid_mask"] = pid_mask
-                        batch.batch["pid_group_mask"] = pid_group_mask
+                        ptd_mask = has_hint
+                        ptd_group_mask = has_hint
+                        batch.batch["ptd_mask"] = ptd_mask
+                        batch.batch["ptd_group_mask"] = ptd_group_mask
 
-                        metrics["opsd/mask_ratio"] = pid_mask.float().mean().item()
-                        metrics["opsd/active_samples"] = pid_mask.sum().item()
+                        metrics["opsd/mask_ratio"] = ptd_mask.float().mean().item()
+                        metrics["opsd/active_samples"] = ptd_mask.sum().item()
 
                         # Teacher forward using FROZEN ref model
-                        if pid_mask.any():
+                        if ptd_mask.any():
                             with timer("teacher", timing_raw):
                                 teacher_output = self.actor_rollout_ref_wg.compute_ref_teacher_log_probs(batch)
                                 batch = batch.union(teacher_output)
@@ -785,12 +785,12 @@ class RayPPOTrainer:
                             )
                             metrics.update(kl_metrics)
 
-                            # Zero out KL penalty for PID groups (PID replaces ref KL entirely)
-                            if self.config.algorithm.enable_pid and "pid_group_mask" in batch.batch:
-                                pid_m = batch.batch["pid_group_mask"].unsqueeze(-1).float()  # [B, 1]
+                            # Zero out KL penalty for PTD groups (PTD replaces ref KL entirely)
+                            if self.config.algorithm.enable_ptd and "ptd_group_mask" in batch.batch:
+                                ptd_m = batch.batch["ptd_group_mask"].unsqueeze(-1).float()  # [B, 1]
                                 batch.batch["token_level_rewards"] = (
-                                    batch.batch["token_level_rewards"] * (1 - pid_m)
-                                    + batch.batch["token_level_scores"] * pid_m
+                                    batch.batch["token_level_rewards"] * (1 - ptd_m)
+                                    + batch.batch["token_level_scores"] * ptd_m
                                 )
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]

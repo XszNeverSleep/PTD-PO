@@ -59,7 +59,7 @@ class WorkerHelper:
     def get_availale_master_addr_port(self) -> Tuple[str, str]:
         return self._get_node_ip(), str(self._get_free_port())
 
-    def _get_pid(self):
+    def _get_ptd(self):
         return
 
 

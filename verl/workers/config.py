@@ -52,4 +52,4 @@ class WorkerConfig:
         self.ref.dynamic_batching = self.actor.dynamic_batching
         self.ref.ulysses_size = self.actor.ulysses_size
         self.ref.use_torch_compile = self.actor.use_torch_compile
-        self.ref.pid_top_k = self.actor.pid_top_k
+        self.ref.ptd_top_k = self.actor.ptd_top_k

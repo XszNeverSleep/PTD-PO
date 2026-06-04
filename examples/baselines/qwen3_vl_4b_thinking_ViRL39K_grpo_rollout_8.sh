@@ -52,5 +52,5 @@ CUDA_VISIBLE_DEVICES=${CUDA_IDS} python3 -m verl.trainer.main \
     trainer.total_epochs=${TOTAL_EPOCHES} \
     trainer.save_checkpoint_path=${SAVE_PATH} \
     trainer.val_freq=20 \
-    algorithm.enable_pid=false \
+    algorithm.enable_ptd=false \
     trainer.save_group_stats=true
