@@ -4,24 +4,42 @@
 [![Framework](https://img.shields.io/badge/Built%20on-EasyR1-blue)](https://github.com/hiyouga/EasyR1)
 [![License](https://img.shields.io/badge/License-Apache--2.0-lightgrey)](./LICENSE)
 
-This repository contains the official implementation of **PTD-PO**, a research fork of [EasyR1](https://github.com/hiyouga/EasyR1) for multimodal reinforcement learning. PTD introduces a privileged tutoring branch into on-policy optimization: the student samples from the standard prompt, while the teacher evaluates the same trajectory with hint-augmented context and provides token-level distillation signals.
+Official implementation of PTD-PO(Privileged Tutoring Distillation for Multimodal Policy Optimization)
 
-The codebase keeps EasyR1's scalable VLM training stack and adds PTD variants for GRPO/GSPO-style training.
+PTD-PO is a reinforcement learning framework for multimodal reasoning that introduces **privileged tutoring distillation** into RLVR training. Instead of revealing the answer or complete reasoning trace, PTD-PO teaches the model through carefully constructed answer-free hints, providing dense token-level supervision while preserving exploration during policy optimization.
+
+Built upon the scalable training infrastructure of EasyR1, PTD-PO supports efficient post-training for large vision-language models and consistently improves multimodal reasoning performance across different model scales.
 
 ---
 
-## News
+## 🚀 News
 
 - **[2026-06-04]** We released the first **PTD-PO** codebase.
-- **[2026-06-04]** PTD-GRPO and PTD-GSPO example scripts are available under `examples/ptd-grpo/`.
 
 ---
 
-## The Core Insight: Hard Rollouts Need Privileged Guidance
+## 🎯 TODO List
 
-Outcome-only RL signals are sparse and coarse for multimodal reasoning. When a rollout group fails or contains weak trajectories, the policy receives little information about *how* the reasoning should move toward the correct visual or mathematical evidence.
+- [ ] Release the dataset 
+- [x] Release the source code
 
-PTD addresses this by adding a teacher view with privileged information. The teacher does not generate a new answer during training; instead, it scores the student's sampled trajectory under a hint-augmented prompt and turns the privileged context into dense token-level feedback.
+## ✨ The Key Insight: Teaching The Way, Not The Answer
+
+Reinforcement Learning with Verifiable Rewards (RLVR) has significantly improved multimodal reasoning. However, outcome rewards are sparse and only supervise the final answer.
+
+When a rollout fails, RLVR provides little information about:
+
+- Which visual evidence was ignored.
+- Which reasoning step was incorrect.
+- How the trajectory should be corrected.
+
+Existing self-distillation methods often rely on ground-truth answers or complete solutions, which may introduce shortcut learning and reduce exploration.
+
+PTD-PO addresses this issue by introducing **privileged tutoring distillation**:
+
+> Teach the reasoning path, not the final answer.
+
+The teacher receives answer-free privileged hints, while the student continues learning from the original question-only context.
 
 <p align="center">
   <img src="assets/ptd_insight.png" alt="PTD insight" width="88%">
@@ -29,14 +47,13 @@ PTD addresses this by adding a teacher view with privileged information. The tea
 
 ---
 
-## Our Solution: PTD-Enhanced Policy Optimization
+## 🏗 Framework Overview
 
-PTD is designed as a lightweight extension to existing on-policy RL algorithms. It keeps the rollout and reward pipeline unchanged, then adds a distillation objective on selected samples:
+PTD-PO combines standard RLVR optimization with privileged tutoring distillation.
 
-1. **Student rollout**: the actor samples responses from the standard prompt.
-2. **Group filtering**: PTD activates on groups whose accuracy is below a configurable threshold.
-3. **Privileged teacher scoring**: a frozen reference teacher evaluates the same response with a hint-augmented prompt.
-4. **Token-level distillation**: the actor receives an auxiliary KL/JSD loss from the teacher distribution.
+During training, the actor samples responses from the original multimodal prompt and receives verifiable rewards through GRPO-style optimization. For failed trajectories, a frozen reference model is queried under a hint-augmented context containing privileged spatial and reasoning guidance. The resulting teacher distribution is then aligned with the student through a lightweight token-level distillation objective.
+
+To further stabilize asymmetric teacher-student alignment, PTD-PO introduces a memory-efficient **Top-K Jensen–Shannon Distillation** objective with tail compensation, reducing distillation overhead while preserving informative probability mass.
 
 <p align="center">
   <img src="assets/ptd_framework.png" alt="PTD framework" width="92%">
@@ -52,9 +69,9 @@ PTD currently supports:
 
 ---
 
-## Main Results
+## 🏆Main Results
 
-PTD improves multimodal reasoning by injecting dense guidance into hard rollout groups while preserving the standard on-policy optimization path.
+PTD-PO consistently improves multimodal reasoning performance over RLVR baselines and existing distillation methods across Qwen3-VL models ranging from 2B to 8B parameters.
 
 <p align="center">
   <img src="assets/main_results.jpg" alt="Main results" width="92%">
