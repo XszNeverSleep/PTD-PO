@@ -1,8 +1,7 @@
 # PTD-PO: Privileged Tutoring Distillation for Multimodal Policy Optimization
 
 [![GitHub](https://img.shields.io/badge/GitHub-PTD--PO-green)](https://github.com/XszNeverSleep/PTD-PO)
-[![Framework](https://img.shields.io/badge/Built%20on-EasyR1-blue)](https://github.com/hiyouga/EasyR1)
-[![License](https://img.shields.io/badge/License-Apache--2.0-lightgrey)](./LICENSE)
+[![arXiv](https://img.shields.io/badge/arXiv-2606.07000-b31b1b.svg)](https://arxiv.org/abs/2606.07000)                                                                                                                                                                                                    [![License](https://img.shields.io/badge/License-Apache--2.0-lightgrey)](./LICENSE)
 
 Official implementation of PTD-PO(Privileged Tutoring Distillation for Multimodal Policy Optimization)
 
@@ -45,6 +44,7 @@ The teacher receives answer-free privileged hints, while the student continues l
   <img src="assets/ptd_insight.png" alt="PTD insight" width="88%">
 </p>
 
+
 ---
 
 ## 🏗 Framework Overview
@@ -58,6 +58,7 @@ To further stabilize asymmetric teacher-student alignment, PTD-PO introduces a m
 <p align="center">
   <img src="assets/ptd_framework.png" alt="PTD framework" width="92%">
 </p>
+
 
 PTD currently supports:
 
@@ -76,6 +77,7 @@ PTD-PO consistently improves multimodal reasoning performance over RLVR baseline
 <p align="center">
   <img src="assets/main_results.jpg" alt="Main results" width="92%">
 </p>
+
 
 ---
 
